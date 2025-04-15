@@ -265,23 +265,27 @@ def fetch_historical_candles(token, target_date):
 def initialize_pivot_points_and_range(target_date=None):
     pivot_points = {}
     opening_ranges = {}
+    logging.info(f"Starting pivot and range calculation for {len(nifty_200_stocks)} stocks")
     for symbol, data in nifty_200_stocks.items():
         token = data["token"]
         if not token or not token.isdigit():
             logging.warning(f"{symbol}: Invalid token '{token}' - Skipping")
-            print(f"⚠️ {symbol}: Invalid token '{token}' - Skipping")
             continue
+        logging.info(f"Processing {symbol} (token: {token})")
         prev_day = fetch_prev_day_data(token, target_date)
+        if prev_day is None:
+            logging.warning(f"{symbol}: Failed to fetch previous day data")
+            continue
         opening_range = fetch_opening_range(token, target_date)
-        if prev_day is not None and opening_range is not None:
-            pivot_points[symbol] = calculate_pivots(prev_day)
-            opening_ranges[symbol] = opening_range
-            logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}")
-            print(f"✅ {symbol} Pivot Levels and Opening Range Calculated")
-        else:
-            logging.warning(f"{symbol}: Could not calculate pivot points or opening range")
-            print(f"⚠️ {symbol}: Could not calculate pivot points or opening range")
+        if opening_range is None:
+            logging.warning(f"{symbol}: Failed to fetch opening range")
+            continue
+        pivot_points[symbol] = calculate_pivots(prev_day)
+        opening_ranges[symbol] = opening_range
+        logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}")
+        print(f"✅ {symbol} Pivot Levels and Opening Range Calculated")
         time.sleep(0.2)  # Avoid rate limits
+    logging.info(f"Completed pivot and range calculation. Processed {len(pivot_points)} stocks")
     return pivot_points, opening_ranges
 
 # New Function to Save live_data_store to CSV
