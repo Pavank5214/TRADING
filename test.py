@@ -1061,4 +1061,6 @@ if __name__ == "__main__":
     print(f"🚀 Starting Nifty 200 pivot scan on {datetime.datetime.now()}")
     scanner_thread = threading.Thread(target=live_market_scan, name="live_scan", daemon=True)
     scanner_thread.start()
-    app.run(debug=False, host="127.0.0.1", port=5000)
+    # Use Render's PORT environment variable or default to 5000
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
