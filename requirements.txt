@@ -29,8 +29,3 @@ urllib3==2.0.3
 websocket-client==1.8.0
 zope.interface==6.0
 Flask==2.3.2
-SmartApi==1.2.3  # Use the latest compatible version
-pyotp==2.6.0
-pandas==1.5.3
-numpy==1.23.5
-futures==3.3.0
