@@ -260,12 +260,78 @@ def fetch_historical_candles(token, target_date):
             logging.error(f"Token {token} - Historical Data Error (Attempt {attempt + 1}): {e}")
             time.sleep(2 ** attempt)
     return None
+    # Fetch Historical Hourly Candles
+def fetch_hourly_candles(token, target_date=None):
+    ist = pytz.timezone("Asia/Kolkata")
+    try:
+        if target_date:
+            start_time = datetime.datetime.strptime(f"{target_date} 09:15", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+            end_time = datetime.datetime.strptime(f"{target_date} 15:30", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+        else:
+            now = datetime.datetime.now(ist)
+            start_time = now - datetime.timedelta(days=1)  # Last 24 hours
+            end_time = now
+    except ValueError:
+        logging.error(f"Invalid target_date format: {target_date}")
+        return None
+    
+    if end_time > datetime.datetime.now(ist):
+        logging.warning(f"Cannot fetch hourly candles for future time: {end_time}")
+        return None
+    
+    params = {
+        "exchange": "NSE",
+        "symboltoken": token,
+        "interval": "ONE_HOUR",
+        "fromdate": start_time.strftime("%Y-%m-%d %H:%M"),
+        "todate": end_time.strftime("%Y-%m-%d %H:%M"),
+    }
+    for attempt in range(5):
+        try:
+            response = smartApi.getCandleData(params)
+            if response.get("status") and response["data"]:
+                df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                return df
+            logging.warning(f"Token {token} - No hourly data: {response.get('message', 'No data')}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            logging.error(f"Token {token} - Hourly Data Error (Attempt {attempt + 1}): {e}")
+            time.sleep(2 ** attempt)
+    return None
+
+# Detect Hourly Chart Patterns (Basic Double Top/Bottom)
+def detect_hourly_patterns(candles):
+    if candles is None or len(candles) < 5:  # Need at least 5 candles for pattern detection
+        return "No pattern"
+    
+    highs = candles["high"].values
+    lows = candles["low"].values
+    pattern = "No pattern"
+    
+    # Simple Double Top Detection
+    for i in range(len(highs) - 3):
+        if (abs(highs[i] - highs[i + 2]) / highs[i] < 0.01 and  # Peaks within 1% of each other
+            highs[i] > highs[i + 1] and highs[i + 2] > highs[i + 3] and
+            lows[i + 1] < highs[i] * 0.99):  # Valley between peaks
+            pattern = "Double Top"
+            break
+    
+    # Simple Double Bottom Detection
+    for i in range(len(lows) - 3):
+        if (abs(lows[i] - lows[i + 2]) / lows[i] < 0.01 and  # Valleys within 1% of each other
+            lows[i] < lows[i + 1] and lows[i + 2] < lows[i + 3] and
+            highs[i + 1] > lows[i] * 1.01):  # Peak between valleys
+            pattern = "Double Bottom"
+            break
+    
+    return pattern
 
 # Initialize Pivot Points and Opening Range
 def initialize_pivot_points_and_range(target_date=None):
     pivot_points = {}
     opening_ranges = {}
-    logging.info(f"Starting pivot and range calculation for {len(nifty_200_stocks)} stocks")
+    hourly_patterns = {}
+    logging.info(f"Starting pivot, range, and pattern calculation for {len(nifty_200_stocks)} stocks")
     for symbol, data in nifty_200_stocks.items():
         token = data["token"]
         if not token or not token.isdigit():
@@ -280,13 +346,16 @@ def initialize_pivot_points_and_range(target_date=None):
         if opening_range is None:
             logging.warning(f"{symbol}: Failed to fetch opening range")
             continue
+        hourly_candles = fetch_hourly_candles(token, target_date)
+        pattern = detect_hourly_patterns(hourly_candles) if hourly_candles is not None else "No data"
         pivot_points[symbol] = calculate_pivots(prev_day)
         opening_ranges[symbol] = opening_range
-        logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}")
-        print(f"✅ {symbol} Pivot Levels and Opening Range Calculated")
+        hourly_patterns[symbol] = pattern
+        logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}, Pattern: {pattern}")
+        print(f"✅ {symbol} Pivot Levels, Opening Range, and Pattern Calculated")
         time.sleep(0.2)  # Avoid rate limits
-    logging.info(f"Completed pivot and range calculation. Processed {len(pivot_points)} stocks")
-    return pivot_points, opening_ranges
+    logging.info(f"Completed calculation. Processed {len(pivot_points)} stocks")
+    return pivot_points, opening_ranges, hourly_patterns
 
 # New Function to Save live_data_store to CSV
 def save_to_csv():
@@ -338,7 +407,7 @@ def save_to_csv():
 def live_market_scan():
     global live_data_store, active_breakouts, prev_candle_store
     print("Starting live market scan...")
-    pivot_points, opening_ranges = initialize_pivot_points_and_range()
+    pivot_points, opening_ranges, hourly_patterns = initialize_pivot_points_and_range()
     last_candle_time = {symbol: None for symbol in nifty_200_stocks}
     ist = pytz.timezone("Asia/Kolkata")
 
@@ -462,7 +531,8 @@ def live_market_scan():
                 "timestamp": timestamp,
                 "breakout_timestamp": active_breakouts.get(symbol, {}).get("timestamp", "-"),
                 "status": "Confirmed" if symbol in active_breakouts else "-",
-                "sector": nifty_200_stocks[symbol]["sector"]
+                "sector": nifty_200_stocks[symbol]["sector"],
+                "hourly_pattern": hourly_patterns.get(symbol, "No pattern")
             }
             time.sleep(0.1)  # Avoid rate limits
 
@@ -470,13 +540,13 @@ def live_market_scan():
         save_to_csv()
         time.sleep(60)
 
-# Historical Market Scanner (unchanged)
+# Historical Market Scanner
 def historical_market_scan(target_date):
     global live_data_store, active_breakouts
     print(f"Starting historical market scan for {target_date}...")
     live_data_store.clear()
     active_breakouts.clear()
-    pivot_points, opening_ranges = initialize_pivot_points_and_range(target_date)
+    pivot_points, opening_ranges, hourly_patterns = initialize_pivot_points_and_range(target_date)
     ist = pytz.timezone("Asia/Kolkata")
 
     for symbol, data in nifty_200_stocks.items():
@@ -584,13 +654,13 @@ def historical_market_scan(target_date):
                 "timestamp": timestamp,
                 "breakout_timestamp": active_breakouts.get(symbol, {}).get("timestamp", "-"),
                 "status": "Confirmed" if symbol in active_breakouts else "-",
-                "sector": nifty_200_stocks[symbol]["sector"]
+                "sector": nifty_200_stocks[symbol]["sector"],
+                "hourly_pattern": hourly_patterns.get(symbol, "No pattern")
             }
         time.sleep(0.2)  # Avoid rate limits
 
     logging.info(f"Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
     print(f"✅ Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
-
 # Switch Scan Mode
 @app.route('/set-mode', methods=['POST'])
 def set_mode():
@@ -643,7 +713,7 @@ def get_live_data():
     sorted_dict = {symbol: data for symbol, data in sorted_data}
     return jsonify({"mode": scan_mode, "date": historical_date, "data": sorted_dict, "sectors": available_sectors})
 
-# User-Friendly Live Market Page (unchanged)
+# Update HTML to display hourly pattern
 @app.route('/live-market')
 def live_market():
     return render_template_string("""
@@ -774,6 +844,10 @@ def live_market():
             color: #28a745;
             font-weight: bold;
         }
+        .pattern {
+            color: #ff9800;
+            font-weight: bold;
+        }
         .tooltip {
             position: relative;
             cursor: help;
@@ -848,27 +922,11 @@ def live_market():
                 <tr>
                     <th class="tooltip" data-tooltip="Stock Symbol">Symbol</th>
                     <th class="tooltip" data-tooltip="Sector">Sector</th>
-                    <th class="tooltip" data-tooltip="Latest 5-min Candle Close">Close (₹)</th>
-                    <th class="tooltip" data-tooltip="Latest 5-min Candle High">High (₹)</th>
-                    <th class="tooltip" data-tooltip="Latest 5-min Candle Low">Low (₹)</th>
-                    <th class="tooltip" data-tooltip="Pivot Point (Reference)">P (₹)</th>
-                    <th class="tooltip" data-tooltip="First Resistance">R1 (₹)</th>
-                    <th class="tooltip" data-tooltip="Second Resistance">R2 (₹)</th>
-                    <th class="tooltip" data-tooltip="Third Resistance">R3 (₹)</th>
-                    <th class="tooltip" data-tooltip="Fourth Resistance">R4 (₹)</th>
-                    <th class="tooltip" data-tooltip="Fifth Resistance">R5 (₹)</th>
-                    <th class="tooltip" data-tooltip="First Support">S1 (₹)</th>
-                    <th class="tooltip" data-tooltip="Second Support">S2 (₹)</th>
-                    <th class="tooltip" data-tooltip="Third Support">S3 (₹)</th>
-                    <th class="tooltip" data-tooltip="Fourth Support">S4 (₹)</th>
-                    <th class="tooltip" data-tooltip="Fifth Support">S5 (₹)</th>
-                    <th class="tooltip" data-tooltip="Opening Range High (9:15-9:20 AM)">OR High (₹)</th>
-                    <th class="tooltip" data-tooltip="Opening Range Low (9:15-9:20 AM)">OR Low (₹)</th>
                     <th class="tooltip" data-tooltip="Current Breakout Level">Breaking Level</th>
                     <th class="tooltip" data-tooltip="Breakout Direction">Breakout Type</th>
-                    <th class="tooltip" data-tooltip="Time of Latest Candle">Candle Time</th>
                     <th class="tooltip" data-tooltip="Time of Breakout Confirmation">Breakout Time</th>
                     <th class="tooltip" data-tooltip="Breakout Status">Status</th>
+                    <th class="tooltip" data-tooltip="Hourly Chart Pattern (1H TF)">Pattern (1H)</th>
                 </tr>
             </thead>
             <tbody id="marketBody">
@@ -910,27 +968,11 @@ def live_market():
                         row.innerHTML = `
                             <td>${symbol}</td>
                             <td>${info.sector}</td>
-                            <td>${info.close.toFixed(2)}</td>
-                            <td>${info.high.toFixed(2)}</td>
-                            <td>${info.low.toFixed(2)}</td>
-                            <td>${info.p.toFixed(2)}</td>
-                            <td>${info.r1.toFixed(2)}</td>
-                            <td>${info.r2.toFixed(2)}</td>
-                            <td>${info.r3.toFixed(2)}</td>
-                            <td>${info.r4.toFixed(2)}</td>
-                            <td>${info.r5.toFixed(2)}</td>
-                            <td>${info.s1.toFixed(2)}</td>
-                            <td>${info.s2.toFixed(2)}</td>
-                            <td>${info.s3.toFixed(2)}</td>
-                            <td>${info.s4.toFixed(2)}</td>
-                            <td>${info.s5.toFixed(2)}</td>
-                            <td>${info.opening_high.toFixed(2)}</td>
-                            <td>${info.opening_low.toFixed(2)}</td>
                             <td>${info.breaking_level}</td>
                             <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
-                            <td>${formatTimestamp(info.timestamp)}</td>
                             <td>${info.breakout_timestamp === '-' ? '-' : formatTimestamp(info.breakout_timestamp)}</td>
                             <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
+                            <td class="${info.hourly_pattern !== 'No pattern' ? 'pattern' : ''}">${info.hourly_pattern}</td>
                         `;
                         row.dataset.symbol = symbol.toLowerCase();
                         row.dataset.status = info.status;
