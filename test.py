@@ -91,25 +91,45 @@ except FileNotFoundError:
     print("ℹ️ No previous history data found, starting fresh")
 
 # Save scan data to history
+# ... (previous code remains the same until save_to_history())
+
 def save_to_history():
     global history_data
     ist = pytz.timezone("Asia/Kolkata")
     timestamp = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-    history_snapshot = {
-        "timestamp": timestamp,
-        "data": {symbol: dict(live_data_store[symbol]) for symbol in live_data_store}
-    }
+    confirmed_data = {symbol: dict(live_data_store[symbol]) for symbol in live_data_store if live_data_store[symbol].get("status") == "Confirmed"}
+    if not confirmed_data:
+        print(f"Debug: No confirmed breakouts to save at {timestamp}")
+        return
+    history_snapshot = {"timestamp": timestamp, "data": confirmed_data}
     history_data.append(history_snapshot)
-    logging.info(f"Saved scan history at {timestamp} with {len(live_data_store)} records")
-    print(f"💾 Saved scan history at {timestamp}")
+    logging.info(f"Saved scan history at {timestamp} with {len(confirmed_data)} confirmed records")
+    print(f"💾 Saved scan history at {timestamp} with {len(confirmed_data)} confirmed records")
     with open('history_data.json', 'w') as f:
         json.dump(history_data, f)
+    cleanup_history()
+
+def cleanup_history():
+    global history_data
+    ist = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.datetime.now(ist)
+    one_day_ago = current_time - datetime.timedelta(days=1)
+    original_length = len(history_data)
+    history_data = [entry for entry in history_data if datetime.datetime.strptime(entry["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ist) > one_day_ago]
+    if len(history_data) < original_length:  # Check if cleanup occurred
+        logging.info(f"Cleaned up history, removed entries older than {one_day_ago}")
+        print(f"🧹 Cleaned up history, removed entries older than {one_day_ago}")
+        with open('history_data.json', 'w') as f:
+            json.dump(history_data, f)
+
+# ... (rest of the code follows)       
 
 # Generate and serve CSV for download
 def generate_csv():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.datetime.now(ist)
     cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 3:30 PM IST
+    print(f"Debug: Current time (IST): {now}, Cutoff time (IST): {cutoff_time}, Is after cutoff: {now >= cutoff_time}")
 
     if now < cutoff_time:
         logging.warning(f"CSV generation attempted before 3:30 PM IST: {now}")
@@ -117,30 +137,41 @@ def generate_csv():
         return None
 
     if not history_data:
-        logging.error("No history data available for CSV generation")
-        print(f"❌ No history data available for CSV generation")
+        logging.error(f"No history data available for CSV generation at {now}, history_data length: {len(history_data)}")
+        print(f"❌ No history data available for CSV generation at {now}, history_data length: {len(history_data)}")
         return b"No data available for this period"
 
     today = now.strftime("%Y-%m-%d")
     csv_data = "Timestamp,Symbol,Sector,Breaking Level,Breakout Type,Breakout Time,Status,Pattern (1H)\n"
+    confirmed_count = 0
     try:
         for entry in history_data:
             if not entry.get("timestamp") or not entry.get("data"):
-                logging.warning(f"Invalid history entry skipped: {entry}")
+                logging.warning(f"Invalid history entry skipped at {now}: {entry}")
                 continue
             for symbol, data in entry["data"].items():
-                csv_data += f"{entry['timestamp']},{symbol},{data.get('sector', '-')},{data.get('breaking_level', '-')},{data.get('breaking_type', '-')},{data.get('breakout_timestamp', '-')},{data.get('status', '-')},{data.get('hourly_pattern', '-')}\n"
-        logging.info(f"Generated CSV with {len(history_data)} entries at {now}")
-        print(f"✅ Generated CSV with {len(history_data)} entries at {now}")
+                print(f"Debug: Processing entry for {symbol} at {now}, status: {data.get('status')}")
+                if data.get("status") == "Confirmed":
+                    csv_data += f"{entry['timestamp']},{symbol},{data.get('sector', '-')},{data.get('breaking_level', '-')},{data.get('breaking_type', '-')},{data.get('breakout_timestamp', '-')},{data.get('status', '-')},{data.get('hourly_pattern', '-')}\n"
+                    confirmed_count += 1
+        if confirmed_count == 0:
+            total_entries = sum(len(entry['data']) for entry in history_data if entry.get('data'))
+            logging.warning(f"No confirmed breakouts found for CSV generation at {now}, total entries checked: {total_entries}")
+            print(f"⚠️ No confirmed breakouts found for CSV generation at {now}, total entries checked: {total_entries}")
+            return b"No confirmed breakouts available"
+        logging.info(f"Generated CSV with {confirmed_count} confirmed breakouts at {now}")
+        print(f"✅ Generated CSV with {confirmed_count} confirmed breakouts at {now}")
         return csv_data.encode('utf-8')
     except Exception as e:
-        logging.error(f"Error generating CSV: {e}")
-        print(f"❌ Error generating CSV: {e}")
+        logging.error(f"Error generating CSV at {now}: {e}")
+        print(f"❌ Error generating CSV at {now}: {e}")
         return b"Error generating CSV file"
+
 
 @app.route('/download-csv')
 def download_csv():
     csv_content = generate_csv()
+    print(f"Debug: download_csv at {datetime.datetime.now(pytz.timezone('Asia/Kolkata'))} - Generated content length: {len(csv_content) if csv_content else 0} bytes, Content preview: {csv_content[:50] if csv_content else 'None'}")
     if csv_content is None:
         return "CSV download available only after 3:30 PM IST", 403
     elif csv_content.startswith(b"No data") or csv_content.startswith(b"Error"):
@@ -155,7 +186,7 @@ def download_csv():
 def get_history_data():
     return jsonify({"history": history_data})
 
-# Fetch Previous Day's Data
+# Fetch Previous Day's Data (Updated)
 def fetch_prev_day_data(token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
     if target_date:
@@ -181,19 +212,27 @@ def fetch_prev_day_data(token, target_date=None):
         "fromdate": two_days_ago.strftime("%Y-%m-%d 09:15"),
         "todate": prev_day.strftime("%Y-%m-%d 15:30"),
     }
-    for attempt in range(5):
+    print(f"Debug: Attempting fetch_prev_day_data for token {token}")
+    for attempt in range(10):  # Increased to 10 attempts
         try:
             response = smartApi.getCandleData(params)
+            print(f"Debug: fetch_prev_day_data response for token {token}, attempt {attempt + 1}: {response}")
             if response.get("status") and response["data"]:
                 df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                if not df.empty and datetime.datetime.fromtimestamp(df.iloc[-1]["timestamp"] / 1000, tz=ist).date() == prev_day.date():
-                    return df.iloc[-1]
-                logging.warning(f"Token {token} - Returned data does not match previous day: {prev_day.date()}")
-            logging.warning(f"Token {token} - No prev day data: {response.get('message', 'No data')}")
-            time.sleep(2 ** attempt)
+                if not df.empty:
+                    # Parse the ISO string timestamp
+                    candle_date = datetime.datetime.strptime(df.iloc[-1]["timestamp"], "%Y-%m-%dT%H:%M:%S%z").date()
+                    if candle_date == prev_day.date():
+                        return df.iloc[-1]
+                    logging.warning(f"Token {token} - Returned data does not match previous day: {candle_date} vs {prev_day.date()}")
+            logging.warning(f"Token {token} - No prev day data (Attempt {attempt + 1}/10): {response.get('message', 'No data')}")
+            time.sleep(2 ** attempt + 5)  # Increased base delay to 5 seconds + exponential backoff
         except Exception as e:
-            logging.error(f"Token {token} - Prev Day Error (Attempt {attempt + 1}): {e}")
-            time.sleep(2 ** attempt)
+            logging.error(f"Token {token} - Prev Day Error (Attempt {attempt + 1}/10): {e}")
+            print(f"Debug: fetch_prev_day_data error for token {token}, attempt {attempt + 1}: {e}")
+            time.sleep(2 ** attempt + 5)
+    logging.error(f"Token {token} - Failed to fetch prev day data after 10 attempts")
+    print(f"❌ Token {token} - Failed to fetch prev day data after 10 attempts")
     return None
 
 # Fetch 5-Minute Opening Range (9:15–9:20 AM IST)
@@ -410,12 +449,12 @@ def initialize_pivot_points_and_range(target_date=None):
     opening_ranges = {}
     hourly_patterns = {}
     logging.info(f"Starting pivot, range, and pattern calculation for {len(nifty_200_stocks)} stocks")
-    for symbol, data in nifty_200_stocks.items():
+    for idx, (symbol, data) in enumerate(nifty_200_stocks.items()):
         token = data["token"]
         if not token or not token.isdigit():
             logging.warning(f"{symbol}: Invalid token '{token}' - Skipping")
             continue
-        logging.info(f"Processing {symbol} (token: {token})")
+        logging.info(f"Processing {symbol} (token: {token}) - {idx + 1}/{len(nifty_200_stocks)}")
         prev_day = fetch_prev_day_data(token, target_date)
         if prev_day is None:
             logging.warning(f"{symbol}: Failed to fetch previous day data")
@@ -431,7 +470,7 @@ def initialize_pivot_points_and_range(target_date=None):
         hourly_patterns[symbol] = pattern
         logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}, Pattern: {pattern}")
         print(f"✅ {symbol} Pivot Levels, Opening Range, and Pattern Calculated")
-        time.sleep(0.5)  # Avoid rate limits
+        time.sleep(1.0)  # Adjusted to 1.0 as suggested
     logging.info(f"Completed calculation. Processed {len(pivot_points)} stocks")
     return pivot_points, opening_ranges, hourly_patterns
 
@@ -486,12 +525,18 @@ def live_market_scan():
     global live_data_store, active_breakouts, prev_candle_store
     print("Starting live market scan...")
     pivot_points, opening_ranges, hourly_patterns = initialize_pivot_points_and_range()
+    if not pivot_points or not opening_ranges or not hourly_patterns:
+        logging.error("Initialization failed, no pivot points, opening ranges, or hourly patterns")
+        print("❌ Initialization failed, no pivot points, opening ranges, or hourly patterns")
+        return
     last_candle_time = {symbol: None for symbol in nifty_200_stocks}
     ist = pytz.timezone("Asia/Kolkata")
+    print("Debug: Initialization complete, entering live scan loop")
 
     while scan_mode == "live" and threading.current_thread().is_alive():
         scan_time = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
         print(f"Scanning at {scan_time}")
+        breakouts_detected = False
         for symbol, data in nifty_200_stocks.items():
             token = data["token"]
             if not token or not token.isdigit():
@@ -523,7 +568,6 @@ def live_market_scan():
                 "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"], "S4": pivots["S4"], "S5": pivots["S5"]
             }
 
-            # Check for highest breakout level in current candle
             breakout_level = None
             breakout_type = None
             breakout_value = None
@@ -544,42 +588,43 @@ def live_market_scan():
                         breakout_value = level_value
                         break
 
-            # Two-candle confirmation logic
             if breakout_level and prev_candle is not None:
+                print(f"Debug: {symbol} - Checking breakout: prev_close={prev_close}, close={close}, level={breakout_value}")
                 if breakout_type == "Long" and prev_close is not None and prev_close > breakout_value:
-                    if close > breakout_value:  # Confirm with current close
+                    if close > breakout_value:
                         if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
                             active_breakouts[symbol] = {
                                 "level": breakout_level,
                                 "type": breakout_type,
                                 "value": breakout_value,
-                                "timestamp": timestamp  # Set to confirmation candle time
+                                "timestamp": timestamp
                             }
                             logging.info(f"{symbol} - Confirmed {breakout_type} breakout at {breakout_level} (prev_close: {prev_close}, close: {close}, level: {breakout_value}) at {timestamp}")
                             print(f"✅ {symbol} - Confirmed {breakout_type} breakout at {breakout_level} at {timestamp}")
+                            breakouts_detected = True
                     else:
                         if symbol in active_breakouts:
-                            del active_breakouts[symbol]  # Invalidate if close falls below
+                            del active_breakouts[symbol]
                             logging.info(f"{symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
                             print(f"❌ {symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
                 elif breakout_type == "Short" and prev_close is not None and prev_close < breakout_value:
-                    if close < breakout_value:  # Confirm with current close
+                    if close < breakout_value:
                         if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
                             active_breakouts[symbol] = {
                                 "level": breakout_level,
                                 "type": breakout_type,
                                 "value": breakout_value,
-                                "timestamp": timestamp  # Set to confirmation candle time
+                                "timestamp": timestamp
                             }
                             logging.info(f"{symbol} - Confirmed {breakout_type} breakout at {breakout_level} (prev_close: {prev_close}, close: {close}, level: {breakout_value}) at {timestamp}")
                             print(f"✅ {symbol} - Confirmed {breakout_type} breakout at {breakout_level} at {timestamp}")
+                            breakouts_detected = True
                     else:
                         if symbol in active_breakouts:
-                            del active_breakouts[symbol]  # Invalidate if close rises above
+                            del active_breakouts[symbol]
                             logging.info(f"{symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
                             print(f"❌ {symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
 
-            # Store current candle as previous for next iteration
             if prev_candle is not None:
                 prev_candle_store[symbol] = {
                     "close": prev_close,
@@ -614,14 +659,11 @@ def live_market_scan():
                 "hourly_pattern": hourly_patterns.get(symbol, "No pattern")
             }
             print(f"Debug: live_data_store[{symbol}] = {live_data_store.get(symbol, 'Not populated')}")
-            time.sleep(0.5)  # Avoid rate limits
 
-        # Save to history and CSV after each scan cycle
         save_to_history()
-        print(f"Debug: history_data length = {len(history_data)}, sample = {history_data[-1] if history_data else 'None'}")
+        print(f"Debug: history_data length = {len(history_data)}, sample = {history_data[-1] if history_data else 'None'}, breakouts detected = {breakouts_detected}")
         save_to_csv()
         time.sleep(60)
-
 # Historical Market Scanner
 def historical_market_scan(target_date):
     global live_data_store, active_breakouts
