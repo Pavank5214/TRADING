@@ -213,28 +213,28 @@ def fetch_prev_day_data(token, target_date=None):
         "todate": prev_day.strftime("%Y-%m-%d 15:30"),
     }
     print(f"Debug: Attempting fetch_prev_day_data for token {token}")
-    for attempt in range(10):  # Increased to 10 attempts
-        try:
-            response = smartApi.getCandleData(params)
-            print(f"Debug: fetch_prev_day_data response for token {token}, attempt {attempt + 1}: {response}")
-            if response.get("status") and response["data"]:
-                df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                if not df.empty:
-                    # Parse the ISO string timestamp
-                    candle_date = datetime.datetime.strptime(df.iloc[-1]["timestamp"], "%Y-%m-%dT%H:%M:%S%z").date()
-                    if candle_date == prev_day.date():
-                        return df.iloc[-1]
-                    logging.warning(f"Token {token} - Returned data does not match previous day: {candle_date} vs {prev_day.date()}")
-            logging.warning(f"Token {token} - No prev day data (Attempt {attempt + 1}/10): {response.get('message', 'No data')}")
-            time.sleep(2 ** attempt + 5)  # Increased base delay to 5 seconds + exponential backoff
-        except Exception as e:
-            logging.error(f"Token {token} - Prev Day Error (Attempt {attempt + 1}/10): {e}")
-            print(f"Debug: fetch_prev_day_data error for token {token}, attempt {attempt + 1}: {e}")
-            time.sleep(2 ** attempt + 5)
-    logging.error(f"Token {token} - Failed to fetch prev day data after 10 attempts")
-    print(f"❌ Token {token} - Failed to fetch prev day data after 10 attempts")
-    return None
-
+    try:
+        response = smartApi.getCandleData(params)
+        print(f"Debug: fetch_prev_day_data response for token {token}, attempt 1: {response}")
+        if response.get("status") and response["data"]:
+            df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+            if not df.empty:
+                candle_datetime = datetime.datetime.strptime(df.iloc[-1]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+                candle_date = candle_datetime.date()
+                print(f"Debug: Parsed date for token {token}: {candle_date}, Expected: {prev_day.date()}")
+                if candle_date == prev_day.date():
+                    return df.iloc[-1]
+                logging.warning(f"Token {token} - Returned data does not match previous day: {candle_date} vs {prev_day.date()}")
+        elif response.get("status") is False and response.get("errorcode") == "AB1004":
+            logging.warning(f"Token {token} - API error AB1004: {response.get('message')}")
+        else:
+            logging.warning(f"Token {token} - No data received: {response.get('message', 'No data')}")
+    except Exception as e:
+        logging.error(f"Token {token} - Prev Day Error: {e}")
+        print(f"Debug: fetch_prev_day_data error for token {token}: {e}")
+    logging.warning(f"Token {token} - Failed to fetch prev day data after 1 attempt")
+    print(f"⚠️ Token {token} - Failed to fetch prev day data after 1 attempt")
+    return None  # Skip to next stock
 # Fetch 5-Minute Opening Range (9:15–9:20 AM IST)
 def fetch_opening_range(token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
@@ -457,8 +457,8 @@ def initialize_pivot_points_and_range(target_date=None):
         logging.info(f"Processing {symbol} (token: {token}) - {idx + 1}/{len(nifty_200_stocks)}")
         prev_day = fetch_prev_day_data(token, target_date)
         if prev_day is None:
-            logging.warning(f"{symbol}: Failed to fetch previous day data")
-            continue
+            logging.warning(f"{symbol}: Failed to fetch previous day data, skipping to next stock")
+            continue  # Proceed with next stock
         opening_range = fetch_opening_range(token, target_date)
         if opening_range is None:
             logging.warning(f"{symbol}: Failed to fetch opening range")
@@ -470,7 +470,7 @@ def initialize_pivot_points_and_range(target_date=None):
         hourly_patterns[symbol] = pattern
         logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}, Pattern: {pattern}")
         print(f"✅ {symbol} Pivot Levels, Opening Range, and Pattern Calculated")
-        time.sleep(1.0)  # Adjusted to 1.0 as suggested
+        time.sleep(1.0)  # Small delay to avoid overwhelming API
     logging.info(f"Completed calculation. Processed {len(pivot_points)} stocks")
     return pivot_points, opening_ranges, hourly_patterns
 
