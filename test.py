@@ -10,6 +10,7 @@ import threading
 import pytz
 import csv
 import os
+import json
 
 # Setup Logging
 logging.basicConfig(
@@ -79,7 +80,15 @@ prev_candle_store = {}  # Store previous candle data
 scan_mode = "live"
 historical_date = None
 scanner_thread = None
-history_data = []  # Store historical scan data
+
+# Load history data on startup
+try:
+    with open('history_data.json', 'r') as f:
+        history_data = json.load(f)
+    print(f"✅ Loaded {len(history_data)} history entries from history_data.json")
+except FileNotFoundError:
+    history_data = []
+    print("ℹ️ No previous history data found, starting fresh")
 
 # Save scan data to history
 def save_to_history():
@@ -93,30 +102,58 @@ def save_to_history():
     history_data.append(history_snapshot)
     logging.info(f"Saved scan history at {timestamp} with {len(live_data_store)} records")
     print(f"💾 Saved scan history at {timestamp}")
+    with open('history_data.json', 'w') as f:
+        json.dump(history_data, f)
 
 # Generate and serve CSV for download
 def generate_csv():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.datetime.now(ist)
-    if now.hour < 15 or (now.hour == 15 and now.minute < 30):  # Before 3:30 PM IST
+    cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 3:30 PM IST
+
+    if now < cutoff_time:
+        logging.warning(f"CSV generation attempted before 3:30 PM IST: {now}")
+        print(f"⚠️ CSV generation attempted before 3:30 PM IST: {now}")
         return None
+
+    if not history_data:
+        logging.error("No history data available for CSV generation")
+        print(f"❌ No history data available for CSV generation")
+        return b"No data available for this period"
+
     today = now.strftime("%Y-%m-%d")
     csv_data = "Timestamp,Symbol,Sector,Breaking Level,Breakout Type,Breakout Time,Status,Pattern (1H)\n"
-    for entry in history_data:
-        for symbol, data in entry["data"].items():
-            csv_data += f"{entry['timestamp']},{symbol},{data['sector']},{data['breaking_level']},{data['breaking_type']},{data['breakout_timestamp']},{data['status']},{data['hourly_pattern']}\n"
-    return csv_data.encode('utf-8')
+    try:
+        for entry in history_data:
+            if not entry.get("timestamp") or not entry.get("data"):
+                logging.warning(f"Invalid history entry skipped: {entry}")
+                continue
+            for symbol, data in entry["data"].items():
+                csv_data += f"{entry['timestamp']},{symbol},{data.get('sector', '-')},{data.get('breaking_level', '-')},{data.get('breaking_type', '-')},{data.get('breakout_timestamp', '-')},{data.get('status', '-')},{data.get('hourly_pattern', '-')}\n"
+        logging.info(f"Generated CSV with {len(history_data)} entries at {now}")
+        print(f"✅ Generated CSV with {len(history_data)} entries at {now}")
+        return csv_data.encode('utf-8')
+    except Exception as e:
+        logging.error(f"Error generating CSV: {e}")
+        print(f"❌ Error generating CSV: {e}")
+        return b"Error generating CSV file"
 
 @app.route('/download-csv')
 def download_csv():
     csv_content = generate_csv()
     if csv_content is None:
         return "CSV download available only after 3:30 PM IST", 403
+    elif csv_content.startswith(b"No data") or csv_content.startswith(b"Error"):
+        return csv_content.decode('utf-8'), 400
     return app.response_class(
         csv_content,
         mimetype='text/csv',
         headers={"Content-Disposition": f"attachment;filename=scan_history_{datetime.datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}.csv"}
     )
+
+@app.route('/history-data', methods=['GET'])
+def get_history_data():
+    return jsonify({"history": history_data})
 
 # Fetch Previous Day's Data
 def fetch_prev_day_data(token, target_date=None):
@@ -149,7 +186,9 @@ def fetch_prev_day_data(token, target_date=None):
             response = smartApi.getCandleData(params)
             if response.get("status") and response["data"]:
                 df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                return df.iloc[-1]
+                if not df.empty and datetime.datetime.fromtimestamp(df.iloc[-1]["timestamp"] / 1000, tz=ist).date() == prev_day.date():
+                    return df.iloc[-1]
+                logging.warning(f"Token {token} - Returned data does not match previous day: {prev_day.date()}")
             logging.warning(f"Token {token} - No prev day data: {response.get('message', 'No data')}")
             time.sleep(2 ** attempt)
         except Exception as e:
@@ -298,7 +337,8 @@ def fetch_historical_candles(token, target_date):
             logging.error(f"Token {token} - Historical Data Error (Attempt {attempt + 1}): {e}")
             time.sleep(2 ** attempt)
     return None
-    # Fetch Historical Hourly Candles
+
+# Fetch Historical Hourly Candles
 def fetch_hourly_candles(token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
     try:
@@ -391,7 +431,7 @@ def initialize_pivot_points_and_range(target_date=None):
         hourly_patterns[symbol] = pattern
         logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}, Pattern: {pattern}")
         print(f"✅ {symbol} Pivot Levels, Opening Range, and Pattern Calculated")
-        time.sleep(0.2)  # Avoid rate limits
+        time.sleep(0.5)  # Avoid rate limits
     logging.info(f"Completed calculation. Processed {len(pivot_points)} stocks")
     return pivot_points, opening_ranges, hourly_patterns
 
@@ -441,7 +481,7 @@ def save_to_csv():
         logging.error(f"Error saving to {csv_file}: {e}")
         print(f"❌ Error saving to {csv_file}: {e}")
 
-## Updated Live Market Scanner with Two-Candle Confirmation and History
+# Updated Live Market Scanner with Two-Candle Confirmation and History
 def live_market_scan():
     global live_data_store, active_breakouts, prev_candle_store
     print("Starting live market scan...")
@@ -458,8 +498,9 @@ def live_market_scan():
                 continue
             if symbol not in pivot_points or symbol not in opening_ranges:
                 continue
-            candles = fetch_latest_candle(symbol, token)  # Fetch last 2 candles
+            candles = fetch_latest_candle(symbol, token)
             if candles is None or len(candles) < 1:
+                print(f"Debug: fetch_latest_candle failed for {symbol}")
                 continue
 
             current_candle = candles.iloc[-1]
@@ -572,10 +613,12 @@ def live_market_scan():
                 "sector": nifty_200_stocks[symbol]["sector"],
                 "hourly_pattern": hourly_patterns.get(symbol, "No pattern")
             }
-            time.sleep(0.1)  # Avoid rate limits
+            print(f"Debug: live_data_store[{symbol}] = {live_data_store.get(symbol, 'Not populated')}")
+            time.sleep(0.5)  # Avoid rate limits
 
         # Save to history and CSV after each scan cycle
         save_to_history()
+        print(f"Debug: history_data length = {len(history_data)}, sample = {history_data[-1] if history_data else 'None'}")
         save_to_csv()
         time.sleep(60)
 
@@ -696,10 +739,11 @@ def historical_market_scan(target_date):
                 "sector": nifty_200_stocks[symbol]["sector"],
                 "hourly_pattern": hourly_patterns.get(symbol, "No pattern")
             }
-        time.sleep(0.2)  # Avoid rate limits
+        time.sleep(0.5)  # Avoid rate limits
 
     logging.info(f"Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
     print(f"✅ Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
+
 # Switch Scan Mode
 @app.route('/set-mode', methods=['POST'])
 def set_mode():
@@ -1019,79 +1063,85 @@ def live_market():
     </div>
 
     <script>
-        let sectors = {{ sectors | tojson }};
-        let activeTab = 'live';
+    let sectors = {{ sectors | tojson }};
+    let activeTab = 'live';
 
-        function formatTimestamp(timestamp) {
-            const date = new Date(timestamp);
-            return date.toLocaleString('en-US', {
-                hour: 'numeric',
-                minute: 'numeric',
-                hour12: true,
-                day: 'numeric',
-                month: 'short',
-                year: 'numeric'
+    function formatTimestamp(timestamp) {
+        const date = new Date(timestamp);
+        return date.toLocaleString('en-US', {
+            hour: 'numeric',
+            minute: 'numeric',
+            hour12: true,
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric'
+        });
+    }
+
+    function openTab(tabName) {
+        document.getElementById('live-tab').classList.remove('active');
+        document.getElementById('history-tab').classList.remove('active');
+        document.getElementById(`${tabName}-tab`).classList.add('active');
+        document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+        document.querySelector(`.tab-button[onclick="openTab('${tabName}')"]`).classList.add('active');
+        activeTab = tabName;
+        if (tabName === 'history') {
+            updateHistoryData();
+        } else {
+            updateMarketData();
+        }
+    }
+
+    function updateMarketData() {
+        fetch('/live-data')
+            .then(response => response.json())
+            .then(response => {
+                const data = response.data;
+                const mode = response.mode;
+                const date = response.date;
+                sectors = response.sectors;
+                updateSectorDropdown();
+                document.getElementById('statusBar').textContent = mode === 'live' ? 'Mode: Live' : `Mode: Historical (Date: ${date})`;
+                const tbody = document.getElementById('marketBody');
+                tbody.innerHTML = '';
+                for (const [symbol, info] of Object.entries(data)) {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${symbol}</td>
+                        <td>${info.sector}</td>
+                        <td>${info.breaking_level}</td>
+                        <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
+                        <td>${info.breakout_timestamp === '-' ? '-' : formatTimestamp(info.breakout_timestamp)}</td>
+                        <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
+                        <td class="${info.hourly_pattern !== 'No pattern' ? 'pattern' : ''}">${info.hourly_pattern}</td>
+                    `;
+                    row.dataset.symbol = symbol.toLowerCase();
+                    row.dataset.status = info.status;
+                    row.dataset.sector = info.sector;
+                    tbody.appendChild(row);
+                }
+                filterTable();
+            })
+            .catch(error => {
+                console.error('Error fetching data:', error);
+                document.getElementById('statusBar').textContent = 'Error fetching data';
             });
-        }
+    }
 
-        function openTab(tabName) {
-            document.getElementById('live-tab').classList.remove('active');
-            document.getElementById('history-tab').classList.remove('active');
-            document.getElementById(`${tabName}-tab`).classList.add('active');
-            document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
-            document.querySelector(`.tab-button[onclick="openTab('${tabName}')"]`).classList.add('active');
-            activeTab = tabName;
-            if (tabName === 'history') {
-                updateHistoryData();
-            } else {
-                updateMarketData();
-            }
-        }
-
-        function updateMarketData() {
-            fetch('/live-data')
-                .then(response => response.json())
-                .then(response => {
-                    const data = response.data;
-                    const mode = response.mode;
-                    const date = response.date;
-                    sectors = response.sectors;
-                    updateSectorDropdown();
-                    document.getElementById('statusBar').textContent = mode === 'live' ? 'Mode: Live' : `Mode: Historical (Date: ${date})`;
-                    const tbody = document.getElementById('marketBody');
-                    tbody.innerHTML = '';
-                    for (const [symbol, info] of Object.entries(data)) {
-                        const row = document.createElement('tr');
-                        row.innerHTML = `
-                            <td>${symbol}</td>
-                            <td>${info.sector}</td>
-                            <td>${info.breaking_level}</td>
-                            <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
-                            <td>${info.breakout_timestamp === '-' ? '-' : formatTimestamp(info.breakout_timestamp)}</td>
-                            <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
-                            <td class="${info.hourly_pattern !== 'No pattern' ? 'pattern' : ''}">${info.hourly_pattern}</td>
-                        `;
-                        row.dataset.symbol = symbol.toLowerCase();
-                        row.dataset.status = info.status;
-                        row.dataset.sector = info.sector;
-                        tbody.appendChild(row);
-                    }
-                    filterTable();
-                })
-                .catch(error => {
-                    console.error('Error fetching data:', error);
-                    document.getElementById('statusBar').textContent = 'Error fetching data';
-                });
-        }
-
-        function updateHistoryData() {
-            fetch('/live-data') // Reuse live-data for simplicity; consider a dedicated /history-data endpoint
-                .then(response => response.json())
-                .then(response => {
-                    const data = response.data;
-                    const tbody = document.getElementById('historyBody');
-                    tbody.innerHTML = '';
-                    for (const entry of history_data) {
+    function updateHistoryData() {
+        fetch('/history-data')
+            .then(response => {
+                if (!response.ok) throw new Error('Network response was not ok');
+                return response.json();
+            })
+            .then(response => {
+                const history = response.history || [];
+                const tbody = document.getElementById('historyBody');
+                tbody.innerHTML = '';
+                if (history.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8">No history data available</td></tr>';
+                } else {
+                    history.forEach(entry => {
                         for (const [symbol, info] of Object.entries(entry["data"])) {
                             const row = document.createElement('tr');
                             row.innerHTML = `
@@ -1109,105 +1159,74 @@ def live_market():
                             row.dataset.sector = info.sector;
                             tbody.appendChild(row);
                         }
-                    }
-                    filterTable();
-                    checkDownloadAvailability();
-                })
-                .catch(error => {
-                    console.error('Error fetching history:', error);
-                    document.getElementById('statusBar').textContent = 'Error fetching history';
-                });
-        }
-
-        function updateSectorDropdown() {
-            const sectorFilter = document.getElementById('sectorFilter');
-            const currentValue = sectorFilter.value;
-            sectorFilter.innerHTML = '<option value="all">All Sectors</option>';
-            sectors.forEach(sector => {
-                const option = document.createElement('option');
-                option.value = sector;
-                option.textContent = sector;
-                sectorFilter.appendChild(option);
-            });
-            sectorFilter.value = currentValue && sectors.includes(currentValue) ? currentValue : 'all';
-        }
-
-        function filterTable() {
-            const search = document.getElementById('search').value.toLowerCase();
-            const filterToggle = document.getElementById('filterToggle').checked;
-            const sector = document.getElementById('sectorFilter').value;
-            const rows = document.querySelectorAll(`${activeTab === 'live' ? '#marketTable' : '#historyTable'} tbody tr`);
-
-            rows.forEach(row => {
-                const symbol = row.dataset.symbol;
-                const status = row.dataset.status;
-                const rowSector = row.dataset.sector;
-                const matchesSearch = symbol.includes(search);
-                const matchesFilter = filterToggle ? true : status === 'Confirmed';
-                const matchesSector = sector === 'all' || rowSector === sector;
-                row.style.display = matchesSearch && matchesFilter && matchesSector ? '' : 'none';
-            });
-            document.getElementById('filterLabel').textContent = filterToggle ? 'All Stocks' : 'Confirmed Breakouts';
-        }
-
-        function updateScanMode() {
-            const modeToggle = document.getElementById('modeToggle');
-            const historicalDateInput = document.getElementById('historicalDate');
-            const mode = modeToggle.checked ? 'live' : 'historical';
-            document.getElementById('modeLabel').textContent = modeToggle.checked ? 'Live Scan' : 'Historical Scan';
-
-            if (mode === 'live') {
-                historicalDateInput.style.display = 'none';
-                historicalDateInput.value = '';
-                fetch('/set-mode', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: 'mode=live'
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') updateMarketData();
-                    else alert(data.message);
-                });
-            } else {
-                historicalDateInput.style.display = 'inline-block';
-                if (historicalDateInput.value) {
-                    fetch('/set-mode', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `mode=historical&date=${historicalDateInput.value}`
-                    }).then(response => response.json()).then(data => {
-                        if (data.status === 'success') updateMarketData();
-                        else alert(data.message);
-                    }).catch(error => {
-                        console.error('Error switching mode:', error);
-                        alert('Error switching to historical mode');
                     });
                 }
-            }
-        }
+                filterTable();
+                checkDownloadAvailability();
+                console.log('History data loaded:', history); // Debug log
+            })
+            .catch(error => {
+                console.error('Error fetching history:', error);
+                document.getElementById('statusBar').textContent = 'Error fetching history';
+                document.getElementById('historyBody').innerHTML = '<tr><td colspan="8">Error loading history</td></tr>';
+            });
+    }
 
-        function downloadCSV() {
-            window.location.href = '/download-csv';
-        }
+    function updateSectorDropdown() {
+        const sectorFilter = document.getElementById('sectorFilter');
+        const currentValue = sectorFilter.value;
+        sectorFilter.innerHTML = '<option value="all">All Sectors</option>';
+        sectors.forEach(sector => {
+            const option = document.createElement('option');
+            option.value = sector;
+            option.textContent = sector;
+            sectorFilter.appendChild(option);
+        });
+        sectorFilter.value = currentValue && sectors.includes(currentValue) ? currentValue : 'all';
+    }
 
-        function checkDownloadAvailability() {
-            const now = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-            const [date, time] = now.split(', ');
-            const [hour, minute] = time.split(':');
-            const downloadBtn = document.getElementById('downloadBtn');
-            if (parseInt(hour) >= 15 && parseInt(minute) >= 30) {
-                downloadBtn.disabled = false;
-            } else {
-                downloadBtn.disabled = true;
-            }
-        }
+    function filterTable() {
+        const search = document.getElementById('search').value.toLowerCase();
+        const filterToggle = document.getElementById('filterToggle').checked;
+        const sector = document.getElementById('sectorFilter').value;
+        const rows = document.querySelectorAll(`${activeTab === 'live' ? '#marketTable' : '#historyTable'} tbody tr`);
 
-        document.getElementById('historicalDate').addEventListener('change', () => {
-            const date = document.getElementById('historicalDate').value;
-            if (date) {
+        rows.forEach(row => {
+            const symbol = row.dataset.symbol;
+            const status = row.dataset.status;
+            const rowSector = row.dataset.sector;
+            const matchesSearch = symbol.includes(search);
+            const matchesFilter = filterToggle ? true : status === 'Confirmed';
+            const matchesSector = sector === 'all' || rowSector === sector;
+            row.style.display = matchesSearch && matchesFilter && matchesSector ? '' : 'none';
+        });
+        document.getElementById('filterLabel').textContent = filterToggle ? 'All Stocks' : 'Confirmed Breakouts';
+    }
+
+    function updateScanMode() {
+        const modeToggle = document.getElementById('modeToggle');
+        const historicalDateInput = document.getElementById('historicalDate');
+        const mode = modeToggle.checked ? 'live' : 'historical';
+        document.getElementById('modeLabel').textContent = modeToggle.checked ? 'Live Scan' : 'Historical Scan';
+
+        if (mode === 'live') {
+            historicalDateInput.style.display = 'none';
+            historicalDateInput.value = '';
+            fetch('/set-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'mode=live'
+            }).then(response => response.json()).then(data => {
+                if (data.status === 'success') updateMarketData();
+                else alert(data.message);
+            });
+        } else {
+            historicalDateInput.style.display = 'inline-block';
+            if (historicalDateInput.value) {
                 fetch('/set-mode', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: `mode=historical&date=${date}`
+                    body: `mode=historical&date=${historicalDateInput.value}`
                 }).then(response => response.json()).then(data => {
                     if (data.status === 'success') updateMarketData();
                     else alert(data.message);
@@ -1216,18 +1235,52 @@ def live_market():
                     alert('Error switching to historical mode');
                 });
             }
-        });
+        }
+    }
 
-        updateMarketData();
-        setInterval(() => {
-            if (document.getElementById('modeToggle').checked && activeTab === 'live') {
-                updateMarketData();
-            } else if (activeTab === 'history') {
-                updateHistoryData();
-            }
-            checkDownloadAvailability();
-        }, 10000);
-    </script>
+    function downloadCSV() {
+        window.location.href = '/download-csv';
+    }
+
+    function checkDownloadAvailability() {
+        const now = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+        const [date, time] = now.split(', ');
+        const [hour, minute] = time.split(':');
+        const downloadBtn = document.getElementById('downloadBtn');
+        if (parseInt(hour) >= 15 && parseInt(minute) >= 30) {
+            downloadBtn.disabled = false;
+        } else {
+            downloadBtn.disabled = true;
+        }
+    }
+
+    document.getElementById('historicalDate').addEventListener('change', () => {
+        const date = document.getElementById('historicalDate').value;
+        if (date) {
+            fetch('/set-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `mode=historical&date=${date}`
+            }).then(response => response.json()).then(data => {
+                if (data.status === 'success') updateMarketData();
+                else alert(data.message);
+            }).catch(error => {
+                console.error('Error switching mode:', error);
+                alert('Error switching to historical mode');
+            });
+        }
+    });
+
+    updateMarketData();
+    setInterval(() => {
+        if (document.getElementById('modeToggle').checked && activeTab === 'live') {
+            updateMarketData();
+        } else if (activeTab === 'history') {
+            updateHistoryData();
+        }
+        checkDownloadAvailability();
+    }, 10000);
+</script>
 </body>
 </html>
     """, sectors=available_sectors)
