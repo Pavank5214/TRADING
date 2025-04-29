@@ -10,7 +10,6 @@ import threading
 import pytz
 import csv
 import os
-import json
 
 # Setup Logging
 logging.basicConfig(
@@ -76,233 +75,29 @@ nifty_200_stocks, available_sectors = load_stocks_from_csv()
 # Global storage
 live_data_store = {}
 active_breakouts = {}
-prev_candle_store = {}  # Store previous candle data
+prev_candle_store = {}  # New: Store previous candle data
+scan_mode = "live"
+historical_date = None
 scanner_thread = None
-history_data = []
-last_session_date = None
-
-# Load history data on startup
-try:
-    with open('history_data.json', 'r') as f:
-        history_data = json.load(f)
-    print(f"✅ Loaded {len(history_data)} history entries from history_data.json")
-except FileNotFoundError:
-    history_data = []
-    print("ℹ️ No previous history data found, starting fresh")
-
-# Save history data to JSON
-def save_history_to_json():
-    global history_data
-    try:
-        with open('history_data.json', 'w') as f:
-            json.dump(history_data, f)
-        logging.info(f"Saved history data to history_data.json with {len(history_data)} records")
-        print(f"💾 Saved history data to history_data.json")
-    except Exception as e:
-        logging.error(f"Error saving history to history_data.json: {e}")
-        print(f"❌ Error saving history to history_data.json: {e}")
-
-# Check and clear history for new trading session
-def check_and_clear_history():
-    global history_data, last_session_date
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    current_date = now.date()
-    current_time = now.time()
-
-    # Trading session starts at 9:15 AM IST, Monday to Friday
-    is_trading_day = current_date.weekday() < 5  # 0-4 is Monday-Friday
-    is_after_session_start = current_time >= datetime.time(9, 15)
-
-    if is_trading_day and is_after_session_start and last_session_date != current_date:
-        history_data = []
-        last_session_date = current_date
-        save_history_to_json()
-        logging.info(f"Cleared history data for new trading session on {current_date}")
-        print(f"🧹 Cleared history data for new trading session on {current_date}")
-
-# Check if market is open
-def is_market_open():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    current_time = now.time()
-    current_day = now.weekday()
-    
-    # Market hours: 9:15 AM to 3:30 PM IST, Monday to Friday
-    market_open = datetime.time(9, 15)
-    market_close = datetime.time(15, 30)
-    is_trading_day = current_day < 5  # Monday to Friday
-    is_within_hours = market_open <= current_time <= market_close
-    
-    # Placeholder for holiday check (not implemented)
-    is_holiday = False  # Replace with actual holiday list check if available
-    
-    return is_trading_day and is_within_hours and not is_holiday
-
-# Generate and serve live CSV for download
-def generate_csv():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 3:30 PM IST
-    print(f"Debug: Current time (IST): {now}, Cutoff time (IST): {cutoff_time}, Is after cutoff: {now >= cutoff_time}")
-
-    if now < cutoff_time:
-        logging.warning(f"CSV generation attempted before 3:30 PM IST: {now}")
-        print(f"⚠️ CSV generation attempted before 3:30 PM IST: {now}")
-        return None
-
-    if not live_data_store:
-        logging.error(f"No live data available for CSV generation at {now}, live_data_store length: {len(live_data_store)}")
-        print(f"❌ No live data available for CSV generation at {now}, live_data_store length: {len(live_data_store)}")
-        return b"No data available for this period"
-
-    today = now.strftime("%Y-%m-%d")
-    csv_data = "Timestamp,Symbol,Sector,Breaking Level,Breakout Type,Breakout Time,Status\n"
-    confirmed_count = 0
-    try:
-        for symbol, data in live_data_store.items():
-            if data.get("status") == "Confirmed":
-                csv_data += f"{data['timestamp']},{symbol},{data.get('sector', '-')},{data.get('breaking_level', '-')},{data.get('breaking_type', '-')},{data.get('breakout_timestamp', '-')},{data.get('status', '-')}\n"
-                confirmed_count += 1
-        if confirmed_count == 0:
-            logging.warning(f"No confirmed breakouts found for CSV generation at {now}, total entries checked: {len(live_data_store)}")
-            print(f"⚠️ No confirmed breakouts found for CSV generation at {now}, total entries checked: {len(live_data_store)}")
-            return b"No confirmed breakouts available"
-        logging.info(f"Generated live CSV with {confirmed_count} confirmed breakouts at {now}")
-        print(f"✅ Generated live CSV with {confirmed_count} confirmed breakouts at {now}")
-        return csv_data.encode('utf-8')
-    except Exception as e:
-        logging.error(f"Error generating live CSV at {now}: {e}")
-        print(f"❌ Error generating live CSV at {now}: {e}")
-        return b"Error generating CSV file"
-
-# Generate and serve history CSV for download
-def generate_history_csv():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    if not history_data:
-        logging.error(f"No history data available for CSV generation at {now}, history_data length: {len(history_data)}")
-        print(f"❌ No history data available for CSV generation at {now}, history_data length: {len(history_data)}")
-        return b"No history data available"
-
-    csv_data = "Timestamp,Symbol,Sector,Breaking Level,Breakout Type,Breakout Time,Status\n"
-    confirmed_count = 0
-    try:
-        for entry in history_data:
-            if not entry.get("timestamp") or not entry.get("data"):
-                logging.warning(f"Invalid history entry skipped at {now}: {entry}")
-                continue
-            for symbol, data in entry["data"].items():
-                if data.get("status") == "Confirmed":
-                    csv_data += f"{entry['timestamp']},{symbol},{data.get('sector', '-')},{data.get('breaking_level', '-')},{data.get('breaking_type', '-')},{data.get('breakout_timestamp', '-')},{data.get('status', '-')}\n"
-                    confirmed_count += 1
-        if confirmed_count == 0:
-            total_entries = sum(len(entry['data']) for entry in history_data if entry.get('data'))
-            logging.warning(f"No confirmed breakouts found for history CSV generation at {now}, total entries checked: {total_entries}")
-            print(f"⚠️ No confirmed breakouts found for history CSV generation at {now}, total entries checked: {total_entries}")
-            return b"No confirmed breakouts available"
-        logging.info(f"Generated history CSV with {confirmed_count} confirmed breakouts at {now}")
-        print(f"✅ Generated history CSV with {confirmed_count} confirmed breakouts at {now}")
-        return csv_data.encode('utf-8')
-    except Exception as e:
-        logging.error(f"Error generating history CSV at {now}: {e}")
-        print(f"❌ Error generating history CSV at {now}: {e}")
-        return b"Error generating history CSV file"
-
-@app.route('/download-csv')
-def download_csv():
-    csv_content = generate_csv()
-    print(f"Debug: download_csv at {datetime.datetime.now(pytz.timezone('Asia/Kolkata'))} - Generated content length: {len(csv_content) if csv_content else 0} bytes, Content preview: {csv_content[:50] if csv_content else 'None'}")
-    if csv_content is None:
-        return "CSV download available only after 3:30 PM IST", 403
-    elif csv_content.startswith(b"No data") or csv_content.startswith(b"Error"):
-        return csv_content.decode('utf-8'), 400
-    return app.response_class(
-        csv_content,
-        mimetype='text/csv',
-        headers={"Content-Disposition": f"attachment;filename=scan_{datetime.datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}.csv"}
-    )
-
-@app.route('/download-history-csv')
-def download_history_csv():
-    csv_content = generate_history_csv()
-    print(f"Debug: download_history_csv at {datetime.datetime.now(pytz.timezone('Asia/Kolkata'))} - Generated content length: {len(csv_content) if csv_content else 0} bytes, Content preview: {csv_content[:50] if csv_content else 'None'}")
-    if csv_content.startswith(b"No data") or csv_content.startswith(b"Error"):
-        return csv_content.decode('utf-8'), 400
-    return app.response_class(
-        csv_content,
-        mimetype='text/csv',
-        headers={"Content-Disposition": f"attachment;filename=history_{datetime.datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}.csv"}
-    )
-
-@app.route('/logs', methods=['GET'])
-def get_logs():
-    log_file = "nifty200_pivot_scan.log"
-    try:
-        if not os.path.exists(log_file):
-            logging.warning("Log file not found")
-            return "Log file not found", 404
-        with open(log_file, 'r') as f:
-            logs = f.read()
-        return logs, 200, {'Content-Type': 'text/plain'}
-    except Exception as e:
-        logging.error(f"Error reading log file: {e}")
-        return f"Error reading log file: {e}", 500
-
-@app.route('/clear-logs', methods=['POST'])
-def clear_logs():
-    log_file = "nifty200_pivot_scan.log"
-    try:
-        with open(log_file, 'w') as f:
-            f.write("")
-        logging.info("Log file cleared by user")
-        return jsonify({"message": "Logs cleared successfully"}), 200
-    except Exception as e:
-        logging.error(f"Error clearing log file: {e}")
-        return jsonify({"error": f"Error clearing log file: {e}"}), 500
-
-@app.route('/live-data', methods=['GET'])
-def get_live_data():
-    ist = pytz.timezone("Asia/Kolkata")
-    last_updated = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-    market_open = is_market_open()
-    if not market_open:
-        return jsonify({
-            "data": live_data_store,
-            "sectors": available_sectors,
-            "last_updated": last_updated,
-            "market_open": False
-        })
-    data_list = [(symbol, data) for symbol, data in live_data_store.items()]
-    sorted_data = sorted(
-        data_list,
-        key=lambda x: (
-            x[1]["status"] != "Confirmed",
-            x[1]["breakout_timestamp"] if x[1]["status"] == "Confirmed" else "9999-12-31 23:59:59",
-            x[0]
-        ),
-        reverse=True
-    )
-    sorted_dict = {symbol: data for symbol, data in sorted_data}
-    return jsonify({
-        "data": sorted_dict,
-        "sectors": available_sectors,
-        "last_updated": last_updated,
-        "market_open": True
-    })
-
-@app.route('/history-data', methods=['GET'])
-def get_history_data():
-    ist = pytz.timezone("Asia/Kolkata")
-    last_updated = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-    return jsonify({"history": history_data, "last_updated": last_updated})
 
 # Fetch Previous Day's Data
-def fetch_prev_day_data(token):
+def fetch_prev_day_data(token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
+    if target_date:
+        try:
+            now = datetime.datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=ist)
+        except ValueError:
+            logging.error(f"Invalid target_date format: {target_date}")
+            return None
+    else:
+        now = datetime.datetime.now(ist)
+    
     prev_day = now - datetime.timedelta(days=1)
     two_days_ago = now - datetime.timedelta(days=2)
+    
+    if prev_day > datetime.datetime.now(ist):
+        logging.warning(f"Cannot fetch previous day data for future date: {prev_day.date()}")
+        return None
     
     params = {
         "exchange": "NSE",
@@ -311,36 +106,37 @@ def fetch_prev_day_data(token):
         "fromdate": two_days_ago.strftime("%Y-%m-%d 09:15"),
         "todate": prev_day.strftime("%Y-%m-%d 15:30"),
     }
-    print(f"Debug: Attempting fetch_prev_day_data for token {token}")
-    try:
-        response = smartApi.getCandleData(params)
-        print(f"Debug: fetch_prev_day_data response for token {token}, attempt 1: {response}")
-        if response.get("status") and response["data"]:
-            df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-            if not df.empty:
-                candle_datetime = datetime.datetime.strptime(df.iloc[-1]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
-                candle_date = candle_datetime.date()
-                print(f"Debug: Parsed date for token {token}: {candle_date}, Expected: {prev_day.date()}")
-                if candle_date == prev_day.date():
-                    return df.iloc[-1]
-                logging.warning(f"Token {token} - Returned data does not match previous day: {candle_date} vs {prev_day.date()}")
-        elif response.get("status") is False and response.get("errorcode") == "AB1004":
-            logging.warning(f"Token {token} - API error AB1004: {response.get('message')}")
-        else:
-            logging.warning(f"Token {token} - No data received: {response.get('message', 'No data')}")
-    except Exception as e:
-        logging.error(f"Token {token} - Prev Day Error: {e}")
-        print(f"Debug: fetch_prev_day_data error for token {token}: {e}")
-    logging.warning(f"Token {token} - Failed to fetch prev day data after 1 attempt")
-    print(f"⚠️ Token {token} - Failed to fetch prev day data after 1 attempt")
+    for attempt in range(5):
+        try:
+            response = smartApi.getCandleData(params)
+            if response.get("status") and response["data"]:
+                df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                return df.iloc[-1]
+            logging.warning(f"Token {token} - No prev day data: {response.get('message', 'No data')}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            logging.error(f"Token {token} - Prev Day Error (Attempt {attempt + 1}): {e}")
+            time.sleep(2 ** attempt)
     return None
 
 # Fetch 5-Minute Opening Range (9:15–9:20 AM IST)
-def fetch_opening_range(token):
+def fetch_opening_range(token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
-    today = datetime.datetime.now(ist).date()
+    if target_date:
+        try:
+            today = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
+        except ValueError:
+            logging.error(f"Invalid target_date format: {target_date}")
+            return None
+    else:
+        today = datetime.datetime.now(ist).date()
+    
     start_time = datetime.datetime(today.year, today.month, today.day, 9, 15, tzinfo=ist)
     end_time = datetime.datetime(today.year, today.month, today.day, 9, 20, tzinfo=ist)
+    
+    if start_time > datetime.datetime.now(ist):
+        logging.warning(f"Cannot fetch opening range for future date: {today}")
+        return None
     
     params = {
         "exchange": "NSE",
@@ -391,10 +187,22 @@ def calculate_pivots(prev_day):
     }
 
 # Fetch Latest 5-Minute Candle
-def fetch_latest_candle(symbol, token):
+def fetch_latest_candle(symbol, token, target_date=None):
     ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    start_dt = now - datetime.timedelta(minutes=10)  # Fetch last 10 minutes to get previous candle
+    if target_date:
+        try:
+            now = datetime.datetime.strptime(f"{target_date} 15:30", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+            start_dt = datetime.datetime.strptime(f"{target_date} 09:15", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+        except ValueError:
+            logging.error(f"Invalid target_date format: {target_date}")
+            return None
+    else:
+        now = datetime.datetime.now(ist)
+        start_dt = now - datetime.timedelta(minutes=10)  # Fetch last 10 minutes to get previous candle
+    
+    if now > datetime.datetime.now(ist):
+        logging.warning(f"Cannot fetch candle for future date: {now.date()}")
+        return None
     
     params = {
         "exchange": "NSE",
@@ -419,22 +227,56 @@ def fetch_latest_candle(symbol, token):
             time.sleep(2 ** attempt)
     return None
 
+# Fetch Historical 5-Minute Candles for a Day
+def fetch_historical_candles(token, target_date):
+    ist = pytz.timezone("Asia/Kolkata")
+    try:
+        start_time = datetime.datetime.strptime(f"{target_date} 09:15", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+        end_time = datetime.datetime.strptime(f"{target_date} 15:30", "%Y-%m-%d %H:%M").replace(tzinfo=ist)
+    except ValueError:
+        logging.error(f"Invalid target_date format: {target_date}")
+        return None
+    
+    if end_time > datetime.datetime.now(ist):
+        logging.warning(f"Cannot fetch historical candles for future date: {target_date}")
+        return None
+    
+    params = {
+        "exchange": "NSE",
+        "symboltoken": token,
+        "interval": "FIVE_MINUTE",
+        "fromdate": start_time.strftime("%Y-%m-%d %H:%M"),
+        "todate": end_time.strftime("%Y-%m-%d %H:%M"),
+    }
+    for attempt in range(5):
+        try:
+            response = smartApi.getCandleData(params)
+            if response.get("status") and response["data"]:
+                df = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                return df
+            logging.warning(f"Token {token} - No historical data: {response.get('message', 'No data')}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            logging.error(f"Token {token} - Historical Data Error (Attempt {attempt + 1}): {e}")
+            time.sleep(2 ** attempt)
+    return None
+
 # Initialize Pivot Points and Opening Range
-def initialize_pivot_points_and_range():
+def initialize_pivot_points_and_range(target_date=None):
     pivot_points = {}
     opening_ranges = {}
     logging.info(f"Starting pivot and range calculation for {len(nifty_200_stocks)} stocks")
-    for idx, (symbol, data) in enumerate(nifty_200_stocks.items()):
+    for symbol, data in nifty_200_stocks.items():
         token = data["token"]
         if not token or not token.isdigit():
             logging.warning(f"{symbol}: Invalid token '{token}' - Skipping")
             continue
-        logging.info(f"Processing {symbol} (token: {token}) - {idx + 1}/{len(nifty_200_stocks)}")
-        prev_day = fetch_prev_day_data(token)
+        logging.info(f"Processing {symbol} (token: {token})")
+        prev_day = fetch_prev_day_data(token, target_date)
         if prev_day is None:
-            logging.warning(f"{symbol}: Failed to fetch previous day data, skipping to next stock")
+            logging.warning(f"{symbol}: Failed to fetch previous day data")
             continue
-        opening_range = fetch_opening_range(token)
+        opening_range = fetch_opening_range(token, target_date)
         if opening_range is None:
             logging.warning(f"{symbol}: Failed to fetch opening range")
             continue
@@ -442,11 +284,11 @@ def initialize_pivot_points_and_range():
         opening_ranges[symbol] = opening_range
         logging.info(f"{symbol} Pivot Levels: {pivot_points[symbol]}, Opening Range: {opening_range}")
         print(f"✅ {symbol} Pivot Levels and Opening Range Calculated")
-        time.sleep(1.0)  # Small delay to avoid overwhelming API
-    logging.info(f"Completed calculation. Processed {len(pivot_points)} stocks")
+        time.sleep(0.2)  # Avoid rate limits
+    logging.info(f"Completed pivot and range calculation. Processed {len(pivot_points)} stocks")
     return pivot_points, opening_ranges
 
-# Save live_data_store to CSV
+# New Function to Save live_data_store to CSV
 def save_to_csv():
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.datetime.now(ist).strftime("%Y-%m-%d")
@@ -456,25 +298,11 @@ def save_to_csv():
             {
                 "symbol": symbol,
                 "sector": data["sector"],
-                "close": data["close"],
-                "high": data["high"],
-                "low": data["low"],
                 "p": data["p"],
                 "r1": data["r1"],
-                "r2": data["r2"],
-                "r3": data["r3"],
-                "r4": data["r4"],
-                "r5": data["r5"],
                 "s1": data["s1"],
-                "s2": data["s2"],
-                "s3": data["s3"],
-                "s4": data["s4"],
-                "s5": data["s5"],
-                "opening_high": data["opening_high"],
-                "opening_low": data["opening_low"],
                 "breaking_level": data["breaking_level"],
                 "breaking_type": data["breaking_type"],
-                "timestamp": data["timestamp"],
                 "breakout_timestamp": data["breakout_timestamp"],
                 "status": data["status"]
             }
@@ -492,36 +320,15 @@ def save_to_csv():
         logging.error(f"Error saving to {csv_file}: {e}")
         print(f"❌ Error saving to {csv_file}: {e}")
 
-# Save confirmed breakouts to history
-def save_to_history():
-    global history_data
-    ist = pytz.timezone("Asia/Kolkata")
-    timestamp = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-    confirmed_data = {symbol: dict(live_data_store[symbol]) for symbol in live_data_store if live_data_store[symbol].get("status") == "Confirmed"}
-    if not confirmed_data:
-        print(f"Debug: No confirmed breakouts to save at {timestamp}")
-        return
-    history_snapshot = {"timestamp": timestamp, "data": confirmed_data}
-    history_data.append(history_snapshot)
-    logging.info(f"Saved scan history at {timestamp} with {len(confirmed_data)} confirmed records")
-    print(f"💾 Saved scan history at {timestamp} with {len(confirmed_data)} confirmed records")
-    save_history_to_json()
-
-# Live Market Scanner
+# Updated Live Market Scanner with Two-Candle Confirmation
 def live_market_scan():
     global live_data_store, active_breakouts, prev_candle_store
     print("Starting live market scan...")
     pivot_points, opening_ranges = initialize_pivot_points_and_range()
-    if not pivot_points or not opening_ranges:
-        logging.error("Initialization failed, no pivot points or opening ranges")
-        print("❌ Initialization failed, no pivot points or opening ranges")
-        return
     last_candle_time = {symbol: None for symbol in nifty_200_stocks}
     ist = pytz.timezone("Asia/Kolkata")
-    print("Debug: Initiation complete, entering live scan loop")
 
-    while threading.current_thread().is_alive():
-        check_and_clear_history()
+    while scan_mode == "live" and threading.current_thread().is_alive():
         scan_time = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
         print(f"Scanning at {scan_time}")
         for symbol, data in nifty_200_stocks.items():
@@ -530,9 +337,8 @@ def live_market_scan():
                 continue
             if symbol not in pivot_points or symbol not in opening_ranges:
                 continue
-            candles = fetch_latest_candle(symbol, token)
+            candles = fetch_latest_candle(symbol, token)  # Fetch last 2 candles
             if candles is None or len(candles) < 1:
-                print(f"Debug: fetch_latest_candle failed for {symbol}")
                 continue
 
             current_candle = candles.iloc[-1]
@@ -544,6 +350,8 @@ def live_market_scan():
 
             close, high, low = current_candle["close"], current_candle["high"], current_candle["low"]
             prev_close = prev_candle["close"] if prev_candle is not None else None
+            prev_high = prev_candle["high"] if prev_candle is not None else None
+            prev_low = prev_candle["low"] if prev_candle is not None else None
             prev_timestamp = prev_candle["timestamp"] if prev_candle is not None else None
 
             pivots = pivot_points[symbol]
@@ -553,6 +361,7 @@ def live_market_scan():
                 "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"], "S4": pivots["S4"], "S5": pivots["S5"]
             }
 
+            # Check for highest breakout level in current candle
             breakout_level = None
             breakout_type = None
             breakout_value = None
@@ -573,10 +382,132 @@ def live_market_scan():
                         breakout_value = level_value
                         break
 
+            # Two-candle confirmation logic
             if breakout_level and prev_candle is not None:
-                print(f"Debug: {symbol} - Checking breakout: prev_close={prev_close}, close={close}, level={breakout_value}")
                 if breakout_type == "Long" and prev_close is not None and prev_close > breakout_value:
-                    if close > breakout_value:
+                    if close > breakout_value:  # Confirm with current close
+                        if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
+                            active_breakouts[symbol] = {
+                                "level": breakout_level,
+                                "type": breakout_type,
+                                "value": breakout_value,
+                                "timestamp": timestamp  # Set to confirmation candle time
+                            }
+                            logging.info(f"{symbol} - Confirmed {breakout_type} breakout at {breakout_level} (prev_close: {prev_close}, close: {close}, level: {breakout_value}) at {timestamp}")
+                            print(f"✅ {symbol} - Confirmed {breakout_type} breakout at {breakout_level} at {timestamp}")
+                    else:
+                        if symbol in active_breakouts:
+                            del active_breakouts[symbol]  # Invalidate if close falls below
+                            logging.info(f"{symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
+                            print(f"❌ {symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
+                elif breakout_type == "Short" and prev_close is not None and prev_close < breakout_value:
+                    if close < breakout_value:  # Confirm with current close
+                        if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
+                            active_breakouts[symbol] = {
+                                "level": breakout_level,
+                                "type": breakout_type,
+                                "value": breakout_value,
+                                "timestamp": timestamp  # Set to confirmation candle time
+                            }
+                            logging.info(f"{symbol} - Confirmed {breakout_type} breakout at {breakout_level} (prev_close: {prev_close}, close: {close}, level: {breakout_value}) at {timestamp}")
+                            print(f"✅ {symbol} - Confirmed {breakout_type} breakout at {breakout_level} at {timestamp}")
+                    else:
+                        if symbol in active_breakouts:
+                            del active_breakouts[symbol]  # Invalidate if close rises above
+                            logging.info(f"{symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
+                            print(f"❌ {symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
+
+            # Store current candle as previous for next iteration
+            if prev_candle is not None:
+                prev_candle_store[symbol] = {
+                    "close": prev_close,
+                    "high": prev_high,
+                    "low": prev_low,
+                    "timestamp": prev_timestamp
+                }
+
+            live_data_store[symbol] = {
+                
+                "r1": pivots["R1"],
+               
+                "s1": pivots["S1"],
+               
+                "p": pivots["P"],
+               
+                "breaking_level": active_breakouts.get(symbol, {}).get("level", "-"),
+                "breaking_type": active_breakouts.get(symbol, {}).get("type", "-"),
+                
+                "breakout_timestamp": active_breakouts.get(symbol, {}).get("timestamp", "-"),
+                "status": "Confirmed" if symbol in active_breakouts else "-",
+                "sector": nifty_200_stocks[symbol]["sector"]
+            }
+            time.sleep(0.1)  # Avoid rate limits
+
+        # Save to CSV after each scan cycle
+        save_to_csv()
+        time.sleep(60)
+
+# Historical Market Scanner (unchanged)
+def historical_market_scan(target_date):
+    global live_data_store, active_breakouts
+    print(f"Starting historical market scan for {target_date}...")
+    live_data_store.clear()
+    active_breakouts.clear()
+    pivot_points, opening_ranges = initialize_pivot_points_and_range(target_date)
+    ist = pytz.timezone("Asia/Kolkata")
+
+    for symbol, data in nifty_200_stocks.items():
+        token = data["token"]
+        if not token or not token.isdigit():
+            continue
+        if symbol not in pivot_points or symbol not in opening_ranges:
+            continue
+        candles = fetch_historical_candles(token, target_date)
+        if candles is None or candles.empty:
+            logging.warning(f"{symbol}: No historical candles found for {target_date}")
+            continue
+
+        pivots = pivot_points[symbol]
+        opening_range = opening_ranges[symbol]
+        levels = {
+            "R5": pivots["R5"], "R4": pivots["R4"], "R3": pivots["R3"], "R2": pivots["R2"], "R1": pivots["R1"],
+            "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"], "S4": pivots["S4"], "S5": pivots["S5"]
+        }
+
+        for idx in range(len(candles) - 1):
+            current_candle = candles.iloc[idx + 1]
+            prev_candle = candles.iloc[idx]
+            timestamp = current_candle["timestamp"]
+            close, high, low = current_candle["close"], current_candle["high"], current_candle["low"]
+            prev_close = prev_candle["close"]
+            prev_high = prev_candle["high"]
+            prev_low = prev_candle["low"]
+
+            # Check for highest breakout level in current candle
+            breakout_level = None
+            breakout_type = None
+            breakout_value = None
+            if high > opening_range["high"]:
+                for level_name in ["R5", "R4", "R3", "R2", "R1"]:
+                    level_value = levels[level_name]
+                    if high > level_value:
+                        breakout_level = level_name
+                        breakout_type = "Long"
+                        breakout_value = level_value
+                        break
+            elif low < opening_range["low"]:
+                for level_name in ["S5", "S4", "S3", "S2", "S1"]:
+                    level_value = levels[level_name]
+                    if low < level_value:
+                        breakout_level = level_name
+                        breakout_type = "Short"
+                        breakout_value = level_value
+                        break
+
+            # Two-candle confirmation logic
+            if breakout_level and prev_close is not None:
+                if breakout_type == "Long" and prev_close > breakout_value:
+                    if close > breakout_value:  # Confirm with current close
                         if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
                             active_breakouts[symbol] = {
                                 "level": breakout_level,
@@ -591,8 +522,8 @@ def live_market_scan():
                             del active_breakouts[symbol]
                             logging.info(f"{symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
                             print(f"❌ {symbol} - Long breakout at {breakout_level} invalidated at {timestamp}")
-                elif breakout_type == "Short" and prev_close is not None and prev_close < breakout_value:
-                    if close < breakout_value:
+                elif breakout_type == "Short" and prev_close < breakout_value:
+                    if close < breakout_value:  # Confirm with current close
                         if symbol not in active_breakouts or active_breakouts[symbol]["level"] != breakout_level:
                             active_breakouts[symbol] = {
                                 "level": breakout_level,
@@ -608,43 +539,80 @@ def live_market_scan():
                             logging.info(f"{symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
                             print(f"❌ {symbol} - Short breakout at {breakout_level} invalidated at {timestamp}")
 
-            if prev_candle is not None:
-                prev_candle_store[symbol] = {
-                    "close": prev_close,
-                    "timestamp": prev_timestamp
-                }
-
             live_data_store[symbol] = {
-                "close": close,
-                "high": high,
-                "low": low,
+                
                 "r1": pivots["R1"],
-                "r2": pivots["R2"],
-                "r3": pivots["R3"],
-                "r4": pivots["R4"],
-                "r5": pivots["R5"],
+               
                 "s1": pivots["S1"],
-                "s2": pivots["S2"],
-                "s3": pivots["S3"],
-                "s4": pivots["S4"],
-                "s5": pivots["S5"],
+               
                 "p": pivots["P"],
-                "opening_high": opening_range["high"],
-                "opening_low": opening_range["low"],
+                
                 "breaking_level": active_breakouts.get(symbol, {}).get("level", "-"),
                 "breaking_type": active_breakouts.get(symbol, {}).get("type", "-"),
-                "timestamp": timestamp,
+                
                 "breakout_timestamp": active_breakouts.get(symbol, {}).get("timestamp", "-"),
                 "status": "Confirmed" if symbol in active_breakouts else "-",
                 "sector": nifty_200_stocks[symbol]["sector"]
             }
-            print(f"Debug: live_data_store[{symbol}] = {live_data_store.get(symbol, 'Not populated')}")
+        time.sleep(0.2)  # Avoid rate limits
 
-        save_to_history()
-        save_to_csv()
-        time.sleep(60)
+    logging.info(f"Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
+    print(f"✅ Historical scan for {target_date} completed with {len(live_data_store)} stocks.")
 
-# Flask Route for Live Market
+# Switch Scan Mode
+@app.route('/set-mode', methods=['POST'])
+def set_mode():
+    global scan_mode, historical_date, scanner_thread, prev_candle_store
+    mode = request.form.get('mode')
+    date = request.form.get('date')
+    
+    live_data_store.clear()
+    active_breakouts.clear()
+    prev_candle_store.clear()
+    
+    if mode == "live":
+        scan_mode = "live"
+        historical_date = None
+        logging.info("Switched to Live Market Scan")
+        print("✅ Switched to Live Market Scan")
+        if scanner_thread is None or not scanner_thread.is_alive():
+            scanner_thread = threading.Thread(target=live_market_scan, name="live_scan", daemon=True)
+            scanner_thread.start()
+    elif mode == "historical" and date:
+        try:
+            target_date = datetime.datetime.strptime(date, "%Y-%m-%d")
+            if target_date.date() > datetime.datetime.now().date():
+                return jsonify({"status": "error", "message": "Cannot scan future dates"})
+            scan_mode = "historical"
+            historical_date = date
+            logging.info(f"Switched to Historical Scan for {date}")
+            print(f"✅ Switched to Historical Scan for {date}")
+            historical_market_scan(date)
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid date format (use YYYY-MM-DD)"})
+    else:
+        return jsonify({"status": "error", "message": "Invalid mode or missing date"})
+    
+    return jsonify({"status": "success", "mode": scan_mode, "date": historical_date})
+
+# Live Data Endpoint with Sorting
+@app.route('/live-data', methods=['GET'])
+def get_live_data():
+    data_list = [(symbol, data) for symbol, data in live_data_store.items()]
+    sorted_data = sorted(
+        data_list,
+        key=lambda x: (
+            x[1]["status"] != "Confirmed",
+            x[1]["breakout_timestamp"] if x[1]["status"] == "Confirmed" else "9999-12-31 23:59:59",
+            x[0]
+        ),
+        reverse=True
+    )
+    sorted_dict = {symbol: data for symbol, data in sorted_data}
+    return jsonify({"mode": scan_mode, "date": historical_date, "data": sorted_dict, "sectors": available_sectors})
+
+# User-Friendly Live Market Page (unchanged)
+
 @app.route('/live-market')
 def live_market():
     return render_template_string("""
@@ -656,271 +624,249 @@ def live_market():
     <title>Nifty 200 Pivot Breakouts</title>
     <style>
         :root {
-            --primary: #1a73e8;
-            --success: #28a745;
-            --danger: #dc3545;
-            --bg-light: #f0f2f5;
-            --bg-dark: #1e2a44;
-            --text-light: #333;
-            --text-dark: #e0e0e0;
-            --card-bg-light: #ffffff;
-            --card-bg-dark: #2b3a5e;
-            --shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-            --transition: all 0.3s ease;
-        }
-
-        [data-theme="dark"] {
-            --bg-light: var(--bg-dark);
-            --text-light: var(--text-dark);
-            --card-bg-light: var(--card-bg-dark);
+            --primary-color: #4f46e5; /* Indigo for primary elements */
+            --success-color: #10b981; /* Emerald for confirmed/long */
+            --danger-color: #ef4444; /* Red for short */
+            --background-color: #e5e7eb; /* Light gray background */
+            --card-background: rgba(255, 255, 255, 0.95); /* Glassmorphism */
+            --card-backdrop: blur(12px);
+            --text-color: #111827; /* Deep gray for text */
+            --border-color: rgba(209, 213, 219, 0.5); /* Semi-transparent */
+            --accent-color: #8b5cf6; /* Violet for highlights */
+            --table-header-bg: linear-gradient(135deg, #4f46e5, #7c3aed); /* Gradient */
+            --link-color: #3b82f6; /* Blue for symbol links */
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08);
         }
 
         * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            box-sizing: border-box;
         }
 
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: var(--bg-light);
-            color: var(--text-light);
+            font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #e5e7eb, #d1d5db);
+            color: var(--text-color);
             line-height: 1.6;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
+            padding: 2rem;
+            overflow-x: hidden;
         }
 
         .container {
             max-width: 1600px;
             margin: 0 auto;
-            padding: 1rem;
-            flex: 1;
-        }
-
-        header {
-            text-align: center;
-            margin-bottom: 1.5rem;
         }
 
         h1 {
-            font-size: clamp(1.5rem, 5vw, 2rem);
-            color: var(--primary);
-            margin-bottom: 0.5rem;
+            text-align: center;
+            color: var(--primary-color);
+            font-size: 2.5rem;
+            margin-bottom: 2rem;
+            font-weight: 700;
+            animation: slideIn 0.5s ease-out;
         }
 
         .status-bar {
-            font-size: 0.9rem;
-            background: var(--card-bg-light);
-            padding: 0.5rem;
-            border-radius: 6px;
+            background: var(--card-background);
+            backdrop-filter: var(--card-backdrop);
+            padding: 1rem;
+            border-radius: 1rem;
+            text-align: center;
+            font-weight: 500;
+            margin-bottom: 2rem;
+            font-size: 1rem;
+            color: var(--text-color);
             box-shadow: var(--shadow);
-            margin-bottom: 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-        }
-
-        .clock {
-            font-family: monospace;
-            font-size: 0.9rem;
-            background: #f0f0f0;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-        }
-
-        [data-theme="dark"] .clock {
-            background: #3a4a6e;
-        }
-
-        .tab-buttons {
-            display: flex;
-            gap: 0.5rem;
-            margin-bottom: 1rem;
-        }
-
-        .tab-button {
-            padding: 0.5rem 1rem;
-            background: var(--card-bg-light);
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: var(--transition);
-        }
-
-        .tab-button.active {
-            background: var(--primary);
-            color: white;
-        }
-
-        .tab-button:hover:not(:disabled) {
-            background: var(--primary);
-            color: white;
-            opacity: 0.9;
-        }
-
-        .tab-button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-            color: #666;
+            animation: slideIn 0.6s ease-out;
         }
 
         .controls {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 0.5rem;
-            margin-bottom: 1rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            align-items: center;
+            background: var(--card-background);
+            backdrop-filter: var(--card-backdrop);
+            padding: 1.5rem;
+            border-radius: 1rem;
+            box-shadow: var(--shadow);
+            animation: slideIn 0.7s ease-out;
         }
 
-        .controls input,
-        .controls select,
-        .controls button {
-            padding: 0.5rem;
-            font-size: 0.9rem;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            transition: var(--transition);
+        .controls input, .controls select, .controls button {
+            padding: 0.75rem 1rem;
+            font-size: 0.95rem;
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            transition: all 0.3s ease;
+            background: rgba(255, 255, 255, 0.9);
         }
 
-        .controls input:focus,
-        .controls select:focus {
+        .controls input:focus, .controls select:focus {
             outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.2);
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.2);
         }
 
         .controls button {
-            background: var(--primary);
+            background: var(--primary-color);
             color: white;
             border: none;
             cursor: pointer;
+            font-weight: 600;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            transition: transform 0.2s, background 0.3s;
         }
 
         .controls button:hover {
-            background: #1557b0;
+            background: #4338ca;
+            transform: translateY(-2px);
         }
 
-        .theme-toggle {
+        .controls button:active {
+            transform: translateY(0);
+        }
+
+        .toggle-container {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 0.75rem;
         }
 
-        .theme-toggle input {
-            display: none;
-        }
-
-        .theme-toggle label {
-            width: 40px;
-            height: 20px;
-            background: #ccc;
-            border-radius: 20px;
+        .toggle-switch {
             position: relative;
-            cursor: pointer;
-            transition: var(--transition);
+            width: 48px;
+            height: 24px;
         }
 
-        .theme-toggle label::after {
-            content: '';
-            width: 16px;
-            height: 16px;
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #d1d5db;
+            border-radius: 9999px;
+            transition: background 0.3s ease;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 2px;
+            bottom: 2px;
             background: white;
             border-radius: 50%;
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            transition: var(--transition);
+            transition: transform 0.3s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
         }
 
-        .theme-toggle input:checked + label {
-            background: var(--primary);
+        input:checked + .slider {
+            background: var(--primary-color);
         }
 
-        .theme-toggle input:checked + label::after {
-            transform: translateX(20px);
+        input:checked + .slider:before {
+            transform: translateX(24px);
         }
 
-        .table-wrapper {
-            position: relative;
-            overflow-x: auto;
-            background: var(--card-bg-light);
-            border-radius: 8px;
+        .toggle-label {
+            font-size: 0.95rem;
+            color: var(--text-color);
+            font-weight: 500;
+        }
+
+        .table-container {
+            background: var(--card-background);
+            backdrop-filter: var(--card-backdrop);
+            border-radius: 1rem;
             box-shadow: var(--shadow);
-        }
-
-        .market-closed {
-            text-align: center;
-            padding: 2rem;
-            font-size: 1rem;
-            color: #666;
+            overflow-x: auto;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.9rem;
+            font-size: 0.95rem;
         }
 
         th, td {
-            padding: 0.75rem;
+            padding: 1rem;
             text-align: center;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid var(--border-color);
         }
 
         th {
-            background: var(--primary);
+            background: var(--table-header-bg);
             color: white;
+            font-weight: 600;
             position: sticky;
             top: 0;
             z-index: 10;
             cursor: pointer;
+            user-select: none;
+            transition: background 0.3s ease;
         }
 
-        th.sortable:hover {
-            background: #1557b0;
-        }
-
-        th.sortable::after {
-            content: '↕';
-            margin-left: 0.5rem;
-            opacity: 0.5;
+        th:hover {
+            background: linear-gradient(135deg, #4338ca, #6d28d9);
         }
 
         th.sort-asc::after {
-            content: '↑';
-            opacity: 1;
+            content: ' ▲';
         }
 
         th.sort-desc::after {
-            content: '↓';
-            opacity: 1;
+            content: ' ▼';
+        }
+
+        tr {
+            opacity: 0;
+            animation: fadeIn 0.5s ease forwards;
+            animation-delay: calc(var(--row-index) * 0.05s);
         }
 
         tr:nth-child(even) {
-            background: #fafafa;
-        }
-
-        [data-theme="dark"] tr:nth-child(even) {
-            background: #3a4a6e;
+            background: rgba(243, 244, 246, 0.5);
         }
 
         tr:hover {
-            background: #f5f5f5;
+            background: rgba(229, 231, 235, 0.8);
+            transform: translateY(-2px);
+            transition: all 0.2s ease;
         }
 
-        [data-theme="dark"] tr:hover {
-            background: #4a5a7e;
+        .long {
+            color: var(--success-color);
+            font-weight: 600;
         }
 
-        .long { color: var(--success); font-weight: 600; }
-        .short { color: var(--danger); font-weight: 600; }
-        .confirmed { color: var(--success); font-weight: 600; }
+        .short {
+            color: var(--danger-color);
+            font-weight: 600;
+        }
+
+        .confirmed {
+            color: var(--success-color);
+            font-weight: 600;
+        }
 
         .tooltip {
             position: relative;
+            text-decoration: underline;
+            text-decoration-style: dotted;
+            text-decoration-color: var(--accent-color);
+            cursor: help;
         }
 
         .tooltip:hover::after {
@@ -929,611 +875,422 @@ def live_market():
             bottom: 100%;
             left: 50%;
             transform: translateX(-50%);
-            background: #333;
+            background: rgba(17, 24, 39, 0.95);
             color: white;
-            padding: 0.5rem;
-            border-radius: 4px;
-            font-size: 0.8rem;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-size: 0.85rem;
             white-space: nowrap;
             z-index: 20;
+            animation: fadeIn 0.2s ease;
         }
 
-        .tab-content {
-            display: none;
+        .sl-no {
+            font-weight: 500;
+            color: var(--text-color);
         }
 
-        .tab-content.active {
-            display: block;
+        .symbol-link {
+            color: var(--link-color);
+            text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s ease, transform 0.2s ease;
         }
 
-        .download-btn {
-            margin: 1rem 0;
-            padding: 0.75rem 1.5rem;
-            background: var(--success);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: var(--transition);
+        .symbol-link:hover {
+            color: #1e40af;
+            text-decoration: underline;
+            transform: translateY(-1px);
         }
 
-        .download-btn:hover {
-            background: #218838;
+        .symbol-link:focus {
+            outline: 2px solid var(--primary-color);
+            outline-offset: 2px;
+            border-radius: 2px;
         }
 
-        .download-btn:disabled {
-            background: #ccc;
-            cursor: not-allowed;
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
-        .log-viewer {
-            background: var(--card-bg-light);
-            border-radius: 8px;
-            box-shadow: var(--shadow);
-            padding: 1rem;
-            max-height: 500px;
-            overflow-y: auto;
-            font-family: monospace;
-            font-size: 0.9rem;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-
-        [data-theme="dark"] .log-viewer {
-            background: #3a4a6e;
-        }
-
-        .log-controls {
-            display: flex;
-            gap: 0.5rem;
-            margin-bottom: 1rem;
-        }
-
-        .log-controls button {
-            padding: 0.5rem 1rem;
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: var(--transition);
-        }
-
-        .log-controls button:hover {
-            background: #1557b0;
-        }
-
-        .log-controls button.clear {
-            background: var(--danger);
-        }
-
-        .log-controls button.clear:hover {
-            background: #c82333;
-        }
-
-        .loader {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid var(--primary);
-            border-radius: 50%;
-            width: 24px;
-            height: 24px;
-            animation: spin 1s linear infinite;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            display: none;
-        }
-
-        .loading .loader {
-            display: block;
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
         }
 
         @keyframes spin {
-            0% { transform: translate(-50%, -50%) rotate(0deg); }
-            100% { transform: translate(-50%, -50%) rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .loading::after {
+            content: '';
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--primary-color);
+            border-top: 2px solid transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-left: 0.5rem;
         }
 
         @media (max-width: 768px) {
+            body {
+                padding: 1rem;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+            }
+
             .controls {
-                grid-template-columns: 1fr;
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .controls input, .controls select, .controls button {
+                width: 100%;
             }
 
             table {
-                font-size: 0.8rem;
+                font-size: 0.85rem;
             }
 
             th, td {
-                padding: 0.5rem;
-            }
-
-            th:not(:first-child):not(:nth-child(2)),
-            td:not(:first-child):not(:nth-child(2)) {
-                display: none;
-            }
-
-            .table-wrapper {
-                max-height: 400px;
-                overflow-y: auto;
-            }
-
-            .log-viewer {
-                max-height: 300px;
+                padding: 0.75rem;
             }
         }
 
         @media (max-width: 480px) {
             h1 {
-                font-size: 1.2rem;
+                font-size: 1.5rem;
             }
 
-            .tab-button {
+            th, td {
                 font-size: 0.8rem;
-                padding: 0.5rem;
-            }
-
-            .status-bar {
-                flex-direction: column;
-                gap: 0.5rem;
             }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>Nifty 200 Pivot Breakouts</h1>
-            <div class="status-bar">
-                <span id="statusBar">Mode: Live</span>
-                <span id="clock" class="clock"></span>
-                <div class="theme-toggle">
-                    <input type="checkbox" id="themeToggle">
-                    <label for="themeToggle"></label>
-                    <span>Dark Mode</span>
-                </div>
+        <h1>Nifty 200 Pivot Breakouts</h1>
+        <div class="status-bar" id="statusBar">Mode: Live</div>
+        <div class="controls">
+            <input type="text" id="search" placeholder="Search by symbol..." aria-label="Search stocks by symbol" onkeyup="filterTable()">
+            <select id="sectorFilter" aria-label="Filter by sector" onchange="filterTable()">
+                <option value="all">All Sectors</option>
+                {% for sector in sectors %}
+                <option value="{{ sector }}">{{ sector }}</option>
+                {% endfor %}
+            </select>
+            <div class="toggle-container">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="filterToggle" checked onchange="filterTable()" aria-label="Toggle stock filter">
+                    <span class="slider"></span>
+                </label>
+                <span class="toggle-label" id="filterLabel">All Stocks</span>
             </div>
-        </header>
-        <main>
-            <nav class="tab-buttons">
-                <button id="liveTab" class="tab-button active" onclick="openTab('live')" data-tooltip="Live market data (9:15 AM - 3:30 PM IST, Mon-Fri)">Live</button>
-                <button id="historyTab" class="tab-button" onclick="openTab('history')" data-tooltip="Historical breakout data">History</button>
-                <button id="logsTab" class="tab-button" onclick="openTab('logs')" data-tooltip="View application logs">Logs</button>
-            </nav>
-            <section id="live-tab" class="tab-content active">
-                <div class="controls">
-                    <input type="text" id="search" placeholder="Search by symbol..." oninput="debounceFilter()">
-                    <select id="sectorFilter" onchange="filterTable()">
-                        <option value="all">All Sectors</option>
-                        {% for sector in sectors %}
-                        <option value="{{ sector }}">{{ sector }}</option>
-                        {% endfor %}
-                    </select>
-                    <button onclick="updateMarketData()">Refresh Now</button>
-                </div>
-                <div id="marketClosed" class="market-closed" style="display: none;">
-                    Market is closed. Live data available from 9:15 AM to 3:30 PM IST, Monday to Friday.
-                </div>
-                <div class="table-wrapper">
-                    <div class="loader"></div>
-                    <table id="marketTable">
-                        <thead>
-                            <tr>
-                                <th class="sortable tooltip" data-tooltip="Stock Symbol" data-sort="symbol">Symbol</th>
-                                <th class="sortable tooltip" data-tooltip="Sector" data-sort="sector">Sector</th>
-                                <th class="sortable tooltip" data-tooltip="Current Breakout Level" data-sort="breaking_level">Breaking Level</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Direction" data-sort="breaking_type">Breakout Type</th>
-                                <th class="sortable tooltip" data-tooltip="Time of Breakout Confirmation" data-sort="breakout_timestamp">Breakout Time</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Status" data-sort="status">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="marketBody"></tbody>
-                    </table>
-                </div>
-                <button id="downloadLiveBtn" class="download-btn" onclick="downloadLiveCSV()" disabled>Download Live CSV</button>
-            </section>
-            <section id="history-tab" class="tab-content">
-                <div class="controls">
-                    <input type="text" id="search" placeholder="Search by symbol..." oninput="debounceFilter()">
-                    <select id="sectorFilter" onchange="filterTable()">
-                        <option value="all">All Sectors</option>
-                        {% for sector in sectors %}
-                        <option value="{{ sector }}">{{ sector }}</option>
-                        {% endfor %}
-                    </select>
-                    <button onclick="updateHistoryData()">Refresh Now</button>
-                </div>
-                <div class="table-wrapper">
-                    <div class="loader"></div>
-                    <table id="historyTable">
-                        <thead>
-                            <tr>
-                                <th class="sortable tooltip" data-tooltip="Scan Timestamp" data-sort="timestamp">Timestamp</th>
-                                <th class="sortable tooltip" data-tooltip="Stock Symbol" data-sort="symbol">Symbol</th>
-                                <th class="sortable tooltip" data-tooltip="Sector" data-sort="sector">Sector</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Level" data-sort="breaking_level">Breakout Level</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Direction" data-sort="breaking_type">Breakout Type</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Confirmation Time" data-sort="breakout_timestamp">Breakout Time</th>
-                                <th class="sortable tooltip" data-tooltip="Breakout Status" data-sort="status">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="historyBody"></tbody>
-                    </table>
-                </div>
-                <button id="downloadHistoryBtn" class="download-btn" onclick="downloadHistoryCSV()">Download History CSV</button>
-            </section>
-            <section id="logs-tab" class="tab-content">
-                <div class="log-controls">
-                    <button onclick="updateLogs()">Refresh Logs</button>
-                    <button class="clear" onclick="clearLogs()">Clear Logs</button>
-                </div>
-                <div class="log-viewer" id="logViewer">Loading logs...</div>
-            </section>
-        </main>
+            <div class="toggle-container">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="modeToggle" checked onchange="updateScanMode()" aria-label="Toggle scan mode">
+                    <span class="slider"></span>
+                </label>
+                <span class="toggle-label" id="modeLabel">Live Scan</span>
+            </div>
+            <input type="date" id="historicalDate" style="display: none;" aria-label="Select historical date">
+            <button onclick="updateMarketData()" aria-label="Refresh market data">Refresh Now</button>
+        </div>
+        <div class="table-container">
+            <table id="marketTable" role="grid">
+                <thead>
+                    <tr>
+                        <th data-sort="sl_no" class="tooltip" data-tooltip="Serial Number">Sl No</th>
+                        <th data-sort="symbol" class="tooltip" data-tooltip="Stock Symbol (Click to view on TradingView)">Symbol</th>
+                        <th data-sort="sector" class="tooltip" data-tooltip="Sector">Sector</th>
+                        <th data-sort="p" class="tooltip" data-tooltip="Pivot Point (Reference)">P (₹)</th>
+                        <th data-sort="r1" class="tooltip" data-tooltip="First Resistance">R1 (₹)</th>
+                        <th data-sort="s1" class="tooltip" data-tooltip="First Support">S1 (₹)</th>
+                        <th data-sort="breaking_level" class="tooltip" data-tooltip="Current Breakout Level">Breaking Level</th>
+                        <th data-sort="breaking_type" class="tooltip" data-tooltip="Breakout Direction">Breakout Type</th>
+                        <th data-sort="breakout_timestamp" class="tooltip" data-tooltip="Time of Breakout Confirmation">Breakout Time</th>
+                        <th data-sort="status" class="tooltip" data-tooltip="Breakout Status">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="marketBody">
+                    <!-- Data will be populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <script>
-    let sectors = {{ sectors | tojson }};
-    let activeTab = 'live';
-    let sortState = { column: '', direction: '' };
-    let filterTimeout;
+        let sectors = {{ sectors | tojson }};
+        let sortConfig = { key: 'status', direction: 'desc' };
 
-    function formatTimestamp(timestamp) {
-        if (timestamp === '-') return '-';
-        const date = new Date(timestamp);
-        return date.toLocaleString('en-US', {
-            hour: 'numeric',
-            minute: 'numeric',
-            hour12: true,
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric'
-        });
-    }
-
-    function updateClock() {
-        const now = new Date().toLocaleString('en-US', {
-            timeZone: 'Asia/Kolkata',
-            hour: 'numeric',
-            minute: 'numeric',
-            second: 'numeric',
-            hour12: true
-        });
-        document.getElementById('clock').textContent = now;
-    }
-
-    function isMarketOpen() {
-        const now = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-        const date = new Date(now);
-        const hours = date.getHours();
-        const minutes = date.getMinutes();
-        const day = date.getDay();
-        const isTradingDay = day >= 1 && day <= 5; // Monday to Friday
-        const isWithinHours = (hours > 9 || (hours === 9 && minutes >= 15)) && (hours < 15 || (hours === 15 && minutes <= 30));
-        return isTradingDay && isWithinHours;
-    }
-
-    function updateMarketStatus() {
-        const liveTab = document.getElementById('liveTab');
-        const marketClosed = document.getElementById('marketClosed');
-        const marketTableWrapper = document.querySelector('#live-tab .table-wrapper');
-        const downloadLiveBtn = document.getElementById('downloadLiveBtn');
-        
-        if (isMarketOpen()) {
-            liveTab.disabled = false;
-            liveTab.title = '';
-            marketClosed.style.display = 'none';
-            marketTableWrapper.style.display = 'block';
-            downloadLiveBtn.disabled = false;
-        } else {
-            liveTab.disabled = true;
-            liveTab.title = 'Market is closed';
-            marketClosed.style.display = 'block';
-            marketTableWrapper.style.display = 'none';
-            downloadLiveBtn.disabled = true;
-            if (activeTab === 'live') {
-                openTab('history');
-            }
-        }
-    }
-
-    function openTab(tabName) {
-        if (tabName === 'live' && !isMarketOpen()) {
-            return;
-        }
-        document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
-        document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
-        document.getElementById(`${tabName}-tab`).classList.add('active');
-        document.querySelector(`.tab-button[onclick="openTab('${tabName}')"]`).classList.add('active');
-        activeTab = tabName;
-        sortState = { column: '', direction: '' };
-        if (tabName === 'history') {
-            updateHistoryData();
-        } else if (tabName === 'logs') {
-            updateLogs();
-        } else {
-            updateMarketData();
-        }
-    }
-
-    function setLoading(tab) {
-        const wrapper = document.querySelector(`#${tab}-tab .table-wrapper, #${tab}-tab .log-viewer`);
-        if (wrapper) wrapper.classList.add('loading');
-    }
-
-    function clearLoading(tab) {
-        const wrapper = document.querySelector(`#${tab}-tab .table-wrapper, #${tab}-tab .log-viewer`);
-        if (wrapper) wrapper.classList.remove('loading');
-    }
-
-    function updateMarketData() {
-        if (activeTab !== 'live' || !isMarketOpen()) return;
-        setLoading('live');
-        fetch('/live-data')
-            .then(response => response.json())
-            .then(response => {
-                const data = response.data;
-                sectors = response.sectors;
-                document.getElementById('statusBar').textContent = 'Mode: Live';
-                const tbody = document.getElementById('marketBody');
-                tbody.innerHTML = '';
-                for (const [symbol, info] of Object.entries(data)) {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td>${symbol}</td>
-                        <td>${info.sector}</td>
-                        <td>${info.breaking_level}</td>
-                        <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
-                        <td>${info.breakout_timestamp === '-' ? '-' : formatTimestamp(info.breakout_timestamp)}</td>
-                        <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
-                    `;
-                    row.dataset.symbol = symbol.toLowerCase();
-                    row.dataset.sector = info.sector;
-                    row.dataset.breaking_level = info.breaking_level;
-                    row.dataset.breaking_type = info.breaking_type;
-                    row.dataset.breakout_timestamp = info.breakout_timestamp;
-                    row.dataset.status = info.status;
-                    tbody.appendChild(row);
-                }
-                sortTable();
-                filterTable();
-                clearLoading('live');
-            })
-            .catch(error => {
-                console.error('Error fetching live data:', error);
-                document.getElementById('statusBar').textContent = 'Error fetching data';
-                clearLoading('live');
+        function formatTimestamp(timestamp) {
+            if (timestamp === '-') return '-';
+            const date = new Date(timestamp);
+            return date.toLocaleString('en-US', {
+                hour: 'numeric',
+                minute: 'numeric',
+                hour12: true,
+                day: 'numeric',
+                month: 'short',
+                year: 'numeric'
             });
-    }
+        }
 
-    function updateHistoryData() {
-        if (activeTab !== 'history') return;
-        setLoading('history');
-        fetch('/history-data')
-            .then(response => {
-                if (!response.ok) throw new Error('Network response was not ok');
-                return response.json();
-            })
-            .then(response => {
-                const history = response.history || [];
-                document.getElementById('statusBar').textContent = 'Mode: History';
-                const tbody = document.getElementById('historyBody');
-                tbody.innerHTML = '';
-                if (history.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7">No history data available</td></tr>';
-                } else {
-                    history.forEach(entry => {
-                        for (const [symbol, info] of Object.entries(entry["data"])) {
-                            const row = document.createElement('tr');
-                            row.innerHTML = `
-                                <td>${formatTimestamp(entry['timestamp'])}</td>
-                                <td>${symbol}</td>
-                                <td>${info.sector}</td>
-                                <td>${info.breaking_level}</td>
-                                <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
-                                <td>${info.breakout_timestamp === '-' ? '-' : formatTimestamp(info.breakout_timestamp)}</td>
-                                <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
-                            `;
-                            row.dataset.timestamp = entry['timestamp'];
-                            row.dataset.symbol = symbol.toLowerCase();
-                            row.dataset.sector = info.sector;
-                            row.dataset.breaking_level = info.breaking_level;
-                            row.dataset.breaking_type = info.breaking_type;
-                            row.dataset.breakout_timestamp = info.breakout_timestamp;
-                            row.dataset.status = info.status;
-                            tbody.appendChild(row);
+        function updateMarketData() {
+            const statusBar = document.getElementById('statusBar');
+            statusBar.textContent = 'Loading...';
+            statusBar.classList.add('loading');
+            fetch('/live-data')
+                .then(response => response.json())
+                .then(response => {
+                    const data = response.data;
+                    const mode = response.mode;
+                    const date = response.date;
+                    sectors = response.sectors;
+                    updateSectorDropdown();
+                    statusBar.classList.remove('loading');
+                    statusBar.textContent = mode === 'live' ? 'Mode: Live' : `Mode: Historical (Date: ${date})`;
+                    const tbody = document.getElementById('marketBody');
+                    tbody.innerHTML = '';
+
+                    // Sort data: Confirmed first (by breakout_timestamp desc), then non-confirmed (by symbol)
+                    const sortedEntries = Object.entries(data).sort((a, b) => {
+                        const aStatus = a[1].status === 'Confirmed';
+                        const bStatus = b[1].status === 'Confirmed';
+                        if (aStatus && bStatus) {
+                            return b[1].breakout_timestamp.localeCompare(a[1].breakout_timestamp); // Newest first
+                        } else if (aStatus && !bStatus) {
+                            return -1; // Confirmed before non-confirmed
+                        } else if (!aStatus && bStatus) {
+                            return 1;
+                        } else {
+                            return a[0].localeCompare(b[0]); // Sort by symbol for non-confirmed
                         }
                     });
+
+                    sortedEntries.forEach(([symbol, info], index) => {
+                        const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=NSE:${symbol}`;
+                        const row = document.createElement('tr');
+                        row.style.setProperty('--row-index', index);
+                        row.innerHTML = `
+                            <td class="sl-no">${index + 1}</td>
+                            <td><a href="${tradingViewUrl}" target="_blank" class="symbol-link" aria-label="View ${symbol} chart on TradingView">${symbol}</a></td>
+                            <td>${info.sector}</td>
+                            <td>${info.p.toFixed(2)}</td>
+                            <td>${info.r1.toFixed(2)}</td>
+                            <td>${info.s1.toFixed(2)}</td>
+                            <td>${info.breaking_level}</td>
+                            <td class="${info.breaking_type === 'Long' ? 'long' : info.breaking_type === 'Short' ? 'short' : ''}">${info.breaking_type}</td>
+                            <td>${formatTimestamp(info.breakout_timestamp)}</td>
+                            <td class="${info.status === 'Confirmed' ? 'confirmed' : ''}">${info.status === 'Confirmed' ? '✔ Confirmed' : '-'}</td>
+                        `;
+                        row.dataset.symbol = symbol.toLowerCase();
+                        row.dataset.status = info.status;
+                        row.dataset.sector = info.sector;
+                        row.dataset.p = info.p;
+                        row.dataset.r1 = info.r1;
+                        row.dataset.s1 = info.s1;
+                        row.dataset.breaking_level = info.breaking_level;
+                        row.dataset.breaking_type = info.breaking_type;
+                        row.dataset.breakout_timestamp = info.breakout_timestamp || '9999-12-31';
+                        row.dataset.sl_no = index + 1;
+                        tbody.appendChild(row);
+                    });
+
+                    sortTable();
+                    filterTable();
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                    statusBar.classList.remove('loading');
+                    statusBar.textContent = statusBar.textContent.includes('Historical') ? statusBar.textContent : 'Mode: Live';
+                });
+        }
+
+        function updateSectorDropdown() {
+            const sectorFilter = document.getElementById('sectorFilter');
+            const currentValue = sectorFilter.value;
+            sectorFilter.innerHTML = '<option value="all">All Sectors</option>';
+            sectors.forEach(sector => {
+                const option = document.createElement('option');
+                option.value = sector;
+                option.textContent = sector;
+                sectorFilter.appendChild(option);
+            });
+            sectorFilter.value = currentValue && sectors.includes(currentValue) ? currentValue : 'all';
+        }
+
+        function filterTable() {
+            const search = document.getElementById('search').value.toLowerCase();
+            const filterToggle = document.getElementById('filterToggle').checked;
+            const sector = document.getElementById('sectorFilter').value;
+            const rows = document.querySelectorAll('#marketTable tbody tr');
+
+            rows.forEach(row => {
+                const symbol = row.dataset.symbol;
+                const status = row.dataset.status;
+                const rowSector = row.dataset.sector;
+                const matchesSearch = symbol.includes(search);
+                const matchesFilter = filterToggle ? true : status === 'Confirmed';
+                const matchesSector = sector === 'all' || rowSector === sector;
+                row.style.display = matchesSearch && matchesFilter && matchesSector ? '' : 'none';
+            });
+
+            document.getElementById('filterLabel').textContent = filterToggle ? 'All Stocks' : 'Confirmed Breakouts';
+        }
+
+        function sortTable() {
+            const rows = Array.from(document.querySelectorAll('#marketTable tbody tr'));
+            const key = sortConfig.key;
+            const direction = sortConfig.direction;
+
+            rows.sort((a, b) => {
+                let aValue = a.dataset[key];
+                let bValue = b.dataset[key];
+
+                if (key === 'sl_no' || key === 'p' || key === 'r1' || key === 's1') {
+                    aValue = parseFloat(aValue);
+                    bValue = parseFloat(bValue);
+                    return direction === 'asc' ? aValue - bValue : bValue - aValue;
+                } else if (key === 'breakout_timestamp') {
+                    aValue = aValue === '-' ? '9999-12-31' : aValue;
+                    bValue = bValue === '-' ? '9999-12-31' : bValue;
+                    return direction === 'asc' ? aValue.localeCompare(bValue) : bValue.localeCompare(aValue);
+                } else if (key === 'status') {
+                    aValue = aValue === 'Confirmed' ? 1 : 0;
+                    bValue = bValue === 'Confirmed' ? 1 : 0;
+                    return direction === 'asc' ? aValue - bValue : bValue - aValue;
+                } else {
+                    return direction === 'asc' ? aValue.localeCompare(bValue) : bValue.localeCompare(aValue);
+                }
+            });
+
+            const tbody = document.getElementById('marketBody');
+            tbody.innerHTML = '';
+            rows.forEach((row, index) => {
+                row.style.setProperty('--row-index', index);
+                tbody.appendChild(row);
+            });
+
+            document.querySelectorAll('th').forEach(th => {
+                th.classList.remove('sort-asc', 'sort-desc');
+                if (th.dataset.sort === key) {
+                    th.classList.add(direction === 'asc' ? 'sort-asc' : 'sort-desc');
+                }
+            });
+        }
+
+        function updateScanMode() {
+            const modeToggle = document.getElementById('modeToggle');
+            const historicalDateInput = document.getElementById('historicalDate');
+            const mode = modeToggle.checked ? 'live' : 'historical';
+            document.getElementById('modeLabel').textContent = modeToggle.checked ? 'Live Scan' : 'Historical Scan';
+
+            if (mode === 'live') {
+                historicalDateInput.style.display = 'none';
+                historicalDateInput.value = '';
+                fetch('/set-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `mode=live`
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        updateMarketData();
+                    } else {
+                        alert(data.message);
+                    }
+                });
+            } else {
+                historicalDateInput.style.display = 'inline-block';
+                if (historicalDateInput.value) {
+                    fetch('/set-mode', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: `mode=historical&date=${historicalDateInput.value}`
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            updateMarketData();
+                        } else {
+                            alert(data.message);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error switching mode:', error);
+                        alert('Error switching to historical mode');
+                    });
+                }
+            }
+        }
+
+        document.getElementById('historicalDate').addEventListener('change', () => {
+            const date = document.getElementById('historicalDate').value;
+            if (date) {
+                fetch('/set-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `mode=historical&date=${date}`
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        updateMarketData();
+                    } else {
+                        alert(data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error switching mode:', error);
+                    alert('Error switching to historical mode');
+                });
+            }
+        });
+
+        document.querySelectorAll('th[data-sort]').forEach(th => {
+            th.addEventListener('click', () => {
+                const key = th.dataset.sort;
+                if (sortConfig.key === key) {
+                    sortConfig.direction = sortConfig.direction === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortConfig.key = key;
+                    sortConfig.direction = 'asc';
                 }
                 sortTable();
-                filterTable();
-                clearLoading('history');
-            })
-            .catch(error => {
-                console.error('Error fetching history:', error);
-                document.getElementById('statusBar').textContent = 'Error fetching history';
-                document.getElementById('historyBody').innerHTML = '<tr><td colspan="7">Error loading history</td></tr>';
-                clearLoading('history');
             });
-    }
-
-    function updateLogs() {
-        if (activeTab !== 'logs') return;
-        setLoading('logs');
-        fetch('/logs')
-            .then(response => {
-                if (!response.ok) throw new Error('Failed to fetch logs');
-                return response.text();
-            })
-            .then(logs => {
-                const logViewer = document.getElementById('logViewer');
-                logViewer.textContent = logs || 'No logs available';
-                logViewer.scrollTop = logViewer.scrollHeight;
-                clearLoading('logs');
-            })
-            .catch(error => {
-                console.error('Error fetching logs:', error);
-                document.getElementById('logViewer').textContent = 'Error loading logs';
-                clearLoading('logs');
-            });
-    }
-
-    function clearLogs() {
-        if (!confirm('Are you sure you want to clear all logs? This action cannot be undone.')) return;
-        fetch('/clear-logs', { method: 'POST' })
-            .then(response => response.json())
-            .then(data => {
-                alert(data.message || data.error);
-                updateLogs();
-            })
-            .catch(error => {
-                console.error('Error clearing logs:', error);
-                alert('Error clearing logs');
-            });
-    }
-
-    function updateSectorDropdown() {
-        const sectorFilter = document.getElementById('sectorFilter');
-        if (!sectorFilter) return;
-        const currentValue = sectorFilter.value;
-        sectorFilter.innerHTML = '<option value="all">All Sectors</option>';
-        sectors.forEach(sector => {
-            const option = document.createElement('option');
-            option.value = sector;
-            option.textContent = sector;
-            sectorFilter.appendChild(option);
         });
-        sectorFilter.value = currentValue && sectors.includes(currentValue) ? currentValue : 'all';
-    }
 
-    function debounceFilter() {
-        clearTimeout(filterTimeout);
-        filterTimeout = setTimeout(filterTable, 300);
-    }
-
-    function filterTable() {
-        if (activeTab === 'logs') return;
-        const search = document.getElementById('search')?.value.toLowerCase() || '';
-        const sector = document.getElementById('sectorFilter')?.value || 'all';
-        const rows = document.querySelectorAll(`${activeTab === 'live' ? '#marketTable' : '#historyTable'} tbody tr`);
-
-        rows.forEach(row => {
-            const symbol = row.dataset.symbol;
-            const rowSector = row.dataset.sector;
-            const matchesSearch = symbol.includes(search);
-            const matchesSector = sector === 'all' || rowSector === sector;
-            row.style.display = matchesSearch && matchesSector ? '' : 'none';
-        });
-    }
-
-    function sortTable() {
-        if (activeTab === 'logs') return;
-        const table = document.querySelector(`${activeTab === 'live' ? '#marketTable' : '#historyTable'}`);
-        const tbody = table.querySelector('tbody');
-        const rows = Array.from(tbody.querySelectorAll('tr'));
-        const column = sortState.column;
-        const direction = sortState.direction;
-
-        if (!column) return;
-
-        rows.sort((a, b) => {
-            let aValue = a.dataset[column] || '-';
-            let bValue = b.dataset[column] || '-';
-
-            if (column.includes('timestamp')) {
-                aValue = aValue === '-' ? '9999-12-31' : aValue;
-                bValue = bValue === '-' ? '9999-12-31' : bValue;
-                aValue = new Date(aValue).getTime();
-                bValue = new Date(bValue).getTime();
-            } else {
-                aValue = aValue.toLowerCase();
-                bValue = bValue.toLowerCase();
+        updateMarketData();
+        setInterval(() => {
+            if (document.getElementById('modeToggle').checked) {
+                updateMarketData();
             }
-
-            if (aValue < bValue) return direction === 'asc' ? -1 : 1;
-            if (aValue > bValue) return direction === 'asc' ? 1 : -1;
-            return 0;
-        });
-
-        tbody.innerHTML = '';
-        rows.forEach(row => tbody.appendChild(row));
-    }
-
-    function handleSort(event) {
-        if (activeTab === 'logs') return;
-        const th = event.target.closest('th.sortable');
-        if (!th) return;
-        const column = th.dataset.sort;
-        if (sortState.column === column) {
-            sortState.direction = sortState.direction === 'asc' ? 'desc' : 'asc';
-        } else {
-            sortState.column = column;
-            sortState.direction = 'asc';
-        }
-
-        document.querySelectorAll('th.sortable').forEach(header => {
-            header.classList.remove('sort-asc', 'sort-desc');
-        });
-        th.classList.add(`sort-${sortState.direction}`);
-        sortTable();
-    }
-
-    function downloadLiveCSV() {
-        window.location.href = '/download-csv';
-    }
-
-    function downloadHistoryCSV() {
-        window.location.href = '/download-history-csv';
-    }
-
-    function checkLiveDownloadAvailability() {
-        const now = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-        const [date, time] = now.split(', ');
-        const [hour, minute] = time.split(':');
-        const downloadBtn = document.getElementById('downloadLiveBtn');
-        if (parseInt(hour) >= 15 && parseInt(minute) >= 30) {
-            downloadBtn.disabled = false;
-        } else {
-            downloadBtn.disabled = true;
-        }
-    }
-
-    function toggleTheme() {
-        const isDark = document.getElementById('themeToggle').checked;
-        document.body.dataset.theme = isDark ? 'dark' : 'light';
-        localStorage.setItem('theme', isDark ? 'dark' : 'light');
-    }
-
-    document.getElementById('themeToggle').addEventListener('change', toggleTheme);
-    document.querySelectorAll('.table-wrapper').forEach(wrapper => {
-        wrapper.addEventListener('click', handleSort);
-    });
-
-    if (localStorage.getItem('theme') === 'dark') {
-        document.getElementById('themeToggle').checked = true;
-        document.body.dataset.theme = 'dark';
-    }
-
-    updateClock();
-    setInterval(updateClock, 1000);
-    updateMarketStatus();
-    setInterval(updateMarketStatus, 60000);
-    updateMarketData();
-    setInterval(() => {
-        if (activeTab === 'live' && isMarketOpen()) {
-            updateMarketData();
-        } else if (activeTab === 'history') {
-            updateHistoryData();
-        } else if (activeTab === 'logs') {
-            updateLogs();
-        }
-        checkLiveDownloadAvailability();
-    }, 10000);
+        }, 10000);
     </script>
 </body>
 </html>
     """, sectors=available_sectors)
+
 
 if __name__ == "__main__":
     if not nifty_200_stocks:
@@ -1543,5 +1300,6 @@ if __name__ == "__main__":
     print(f"🚀 Starting Nifty 200 pivot scan on {datetime.datetime.now()}")
     scanner_thread = threading.Thread(target=live_market_scan, name="live_scan", daemon=True)
     scanner_thread.start()
+    # Use Render's PORT environment variable or default to 5000
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
